@@ -1,10 +1,14 @@
 # Ghostty Ink
 
-A terminal for e-ink readers: the **Kobo Libra Colour** (started from NickelMenu, no KOReader) and, experimental and **not yet tested on a Kindle**, the **Kindle Paperwhite 3** (started from KUAL, see [docs/kindle.md](docs/kindle.md)). It is built for one job: SSH into
-another machine, attach tmux, and type on a Bluetooth keyboard.
+A terminal emulator for e-ink readers: the **Kobo Libra Colour** (started from NickelMenu, no KOReader) and, experimental and
+**not yet tested on a Kindle**, the **Kindle Paperwhite 3** (started from KUAL, see [docs/kindle.md](docs/kindle.md)).
+
+It gives you a real local shell on the device, with an on-screen keyboard and touch gestures, so it is usable with nothing
+else attached; pair a Bluetooth keyboard and it becomes a comfortable full-size terminal. It ships an SSH client, so the
+common use is logging in to another machine and attaching tmux, but any command-line program that works in a terminal works here.
 
 ```
-BT keyboard -> evdev -> keymap -> libghostty-vt (terminal state) -> cell grid -> TrueType renderer -> e-ink
+keyboard (BT or on-screen) + touch -> evdev -> keymap -> libghostty-vt (terminal state) -> cell grid -> TrueType renderer -> e-ink
                                           ^
                               pty <-> BusyBox shell -> ssh (dropbear dbclient) -> tmux
 ```
