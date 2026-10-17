@@ -908,7 +908,7 @@ static void redraw_all(bool flash) {
 	memset(slow_row, 0, sizeof slow_row);
 	q_any = false; burst_slow = 0;
 	if (osk_visible) osk_draw_all();
-	if (flash && osk_visible) {          // one flash for the whole screen rather than one per part
+	if (flash) {                         // one flash for the whole screen rather than one per part; it also clears the strip below the last text row (where a hidden keyboard used to be)
 		memset(rr, 0, sizeof rr); rr_any = false;
 		refresh_rect(WFM_GC16, 0, 0, lw, lh, true);
 		return;

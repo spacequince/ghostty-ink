@@ -26,7 +26,8 @@ retry loop never weakens the security model (strict host keys, encrypted key at 
 2. **Reconnect loop in `ssh`.** `ssh -r user@host [cmd]` (and `GHOSTTY_INK_SSH_RECONNECT=1` in `ghostty.conf` to make it the
    default) runs dbclient in a loop:
    - exit 0 or any code other than 255: stop (you left on purpose, or the command failed);
-   - 255 after a session that lasted at least 10 s: wait for the network, then retry with backoff 1, 2, 4, 8 ... capped at 30 s;
+   - 255 after a session that lasted at least 10 s: wait for the network, then retry with backoff 1, 2, 4, 8 ... (long outages: see
+     "Surviving a long disconnect" below);
    - 255 within 10 s of starting (wrong host, auth failure, no route): stop after 3 tries, so a typo does not loop forever;
    - Ctrl-C or the on-screen Esc-Esc cancels the wait and returns to the shell; Enter retries immediately.
 3. **Network wait.** Before each retry, wait until the default route and Wi-Fi are up (poll `/sys/class/net/*/operstate` and the
@@ -37,7 +38,7 @@ retry loop never weakens the security model (strict host keys, encrypted key at 
    entry that runs exactly that for a saved host. Saved hosts (`/etc/ghostty-ink/hosts`, one `name user@host [options]` per line,
    `ssh -r name`) are in scope because typing is the expensive part on an on-screen keyboard.
 5. **Key handling during the loop.** An encrypted key is decrypted into `/tmp` once when the loop starts and removed when the loop
-   ends (trap on exit, INT, TERM, HUP) or after a configurable maximum (default 8 h), instead of asking for the passphrase on every
+   ends (trap on exit, INT, TERM, HUP) or after a configurable maximum (default 8 h, `GHOSTTY_INK_KEY_TTL`), instead of asking for the passphrase on every
    retry. Same exposure as today during a connection, just longer. Opt-out: `ssh -r --ask` prompts on every reconnect.
 6. **Resume after screen lock / sleep.** If the power-button lock or Wi-Fi power-save dropped the link, retry as soon as the
    screen unlocks (the terminal already knows when it unlocks) instead of waiting out the backoff.
@@ -46,6 +47,34 @@ retry loop never weakens the security model (strict host keys, encrypted key at 
    "session ended" screen otherwise.
 8. **Tests and docs.** README limitations updated, `docs/reconnect.md` becomes a user guide, and a test script
    (`tools/test-reconnect.sh`, run on a Linux host against a local dropbear/sshd) covers the exit-code and backoff logic.
+
+## Surviving a long disconnect (hours, within reason)
+
+The server side is the easy part: a tmux session outlives the SSH connection indefinitely, so the loop only has to get back to it.
+Rules so that a lid-closed, router-off, out-of-range or overnight gap still ends with the session back on screen:
+
+- **An established session never gives up on its own.** Only the user (Ctrl-C / Esc-Esc / the menu) ends the loop. The "3 quick
+  failures" rule applies only to a connection that never got established.
+- **Backoff stretches with the outage** to save battery and e-ink: 1, 2, 4, 8, 15, 30 s for the first minutes, then every 60 s up
+  to 10 minutes, then every 5 minutes. A touch, key press, screen unlock or Wi-Fi coming up (operstate change) retries
+  immediately and resets the backoff.
+- **Nothing is cached about the network:** the host name is resolved again on every attempt (the server's IP or the Kobo's Wi-Fi
+  network may have changed), and the retry waits for a default route first instead of burning attempts.
+- **Clock jumps** (NTP fixing the time after a long off period) must not confuse timers: use monotonic time for backoff and
+  keepalive.
+- **Always stop on the things that will never fix themselves:** host key changed (never auto-accepted), authentication refused,
+  key file missing. The message says which and waits for you.
+- **Quiet screen:** during a long wait print one status line and update it at most once a minute (e.g. "reconnecting, last
+  try 10:42, next in 5 min, tap to retry now"); no flashing refreshes.
+- **Decrypted key cap:** with the default 8 h cap, an outage longer than that makes the loop stop and ask for the passphrase at
+  the next tap rather than keep the key in RAM indefinitely. Longer is a config choice (`GHOSTTY_INK_KEY_TTL`).
+- **Wi-Fi power and Nickel:** the spike must establish whether the radio stays associated with the screen locked and Nickel
+  stopped, and whether the Kobo auto-suspends while the terminal runs. If it suspends, hold a wake lock or re-arm on resume.
+- **Server-side tmux gone** (server rebooted): the re-attach command's `new -A` starts a fresh session, so the reconnect still
+  succeeds and the screen says so (the exit/attach banner comes from tmux itself).
+
+Added acceptance tests: 30 s outage (router power), 15 min outage with the screen locked, ~8 h overnight outage, server reboot,
+server IP change (DHCP), and a Kobo reboot (documented as not resumable: a fresh `ssh -r` starts the session).
 
 ## Out of scope for 0.2.0
 
