@@ -1,7 +1,7 @@
 #!/bin/bash
 # Assemble the Kobo release zip: dist/release/ghostty-ink-VERSION-kobo.zip (extract it into the root of the Kobo's USB drive).
 # Usage: ./package-kobo.sh VERSION [BINDIR]   BINDIR defaults to dist/device (build-ghostty-ink.sh, build-key.sh,
-# build-dropbear.sh and optionally build-bash.sh must have run). Fonts are not included (licences; see README).
+# build-dropbear.sh and optionally build-bash.sh must have run). Fonts are not included (licences; see docs/install.md).
 # The binaries are stripped, and the build-machine paths that remain (Zig and Cargo cache locations under $HOME) are rewritten to /home/user
 # (same length, so the binaries stay valid) and the finished tree is scanned for anything that identifies the builder.
 set -euo pipefail

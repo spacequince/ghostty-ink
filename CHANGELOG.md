@@ -10,4 +10,4 @@ First public release.
 - Anti-aliased text, Nerd Font symbols, monochrome emoji, e-ink refresh policy with settings.
 - Plugins (`plugins/NAME.plugin`), off by default.
 - Experimental Kindle Paperwhite 3 port (KUAL): builds, **not yet tested on hardware**.
-- Tested only on a Kobo Libra Colour. Known limitations are in the README.
+- Tested only on a Kobo Libra Colour. Known limitations are in docs/limitations.md.

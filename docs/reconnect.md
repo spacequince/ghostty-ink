@@ -45,7 +45,7 @@ retry loop never weakens the security model (strict host keys, encrypted key at 
 7. **Terminal side.** When the program exits after a connection loss, `Enter = reconnect` reruns the last `ssh` line (saved in
    `$GHOSTTY_INK_STATE/last_ssh`, mode 600, without secrets; commands only) when `ssh -r` was not used. No change to the
    "session ended" screen otherwise.
-8. **Tests and docs.** README limitations updated, `docs/reconnect.md` becomes a user guide, and a test script
+8. **Tests and docs.** docs/limitations.md updated, `docs/reconnect.md` becomes a user guide, and a test script
    (`tools/test-reconnect.sh`, run on a Linux host against a local dropbear/sshd) covers the exit-code and backoff logic.
 
 ## Surviving a long disconnect (hours, within reason)

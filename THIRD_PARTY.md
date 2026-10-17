@@ -14,7 +14,7 @@ repository; the build scripts expect them in `third_party/` (ignored by git). Ve
 | [age](https://github.com/str4d/rage) (Rust `age` crate) | see `tools/ghostty-ink-key/Cargo.lock` | MIT / Apache-2.0 | passphrase encryption of SSH keys |
 | [OpenSSH](https://www.openssh.com) | 10.6p1 | BSD | build experiment only (`build-openssh.sh`), not shipped |
 
-Fonts are **not** included. The README suggests Adwaita Mono (SIL OFL 1.1), Symbols Nerd Font Mono (MIT) and Noto Emoji
+Fonts are **not** included. docs/install.md suggests Adwaita Mono (SIL OFL 1.1), Symbols Nerd Font Mono (MIT) and Noto Emoji
 (SIL OFL 1.1); check each licence before redistributing them.
 
 Corresponding source for any binary release is this repository plus the pinned versions above.
