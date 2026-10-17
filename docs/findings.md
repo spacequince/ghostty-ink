@@ -1,7 +1,6 @@
 # Device findings: Kobo Libra Colour (probe 2026-10-07)
 
-Raw output: `probe-libra-colour.txt` (contains the Wi-Fi MAC/LAN IP; keep this repo private
-or scrub it before publishing).
+Raw output: `probe-libra-colour.txt` (Wi-Fi MAC and LAN IP scrubbed).
 
 - Kernel 4.9.77 armv7l (32-bit userland), MT8110/MT8512 board, 2 cores, 965 MB RAM
   (~690 MB available with Nickel running). rootfs ext4 975 MB (675 MB free),
