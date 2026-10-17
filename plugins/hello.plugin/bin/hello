@@ -1,0 +1,3 @@
+#!/bin/sh
+# A plugin's bin/ folder is on PATH in the Kobo shell.
+echo "Hello from the hello plugin (running on $(uname -n))."

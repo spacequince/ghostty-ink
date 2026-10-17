@@ -1,16 +1,16 @@
 #!/bin/sh
 # Restart Nickel after nickel-stop.sh (legacy start path from KOReader's nickel.sh, which is what
-# this firmware uses). By default Wi-Fi is left up; set KG_DROP_WIFI=1 to tear it down first the way
+# this firmware uses). By default Wi-Fi is left up; set GHOSTTY_INK_DROP_WIFI=1 to tear it down first the way
 # KOReader does (Nickel then brings it back itself).
 PATH="/sbin:/bin:/usr/sbin:/usr/bin:/usr/lib:"
-[ -f /tmp/kg-env ] && . /tmp/kg-env
+[ -f /tmp/ghostty-ink-env ] && . /tmp/ghostty-ink-env
 export LD_LIBRARY_PATH="/usr/local/Kobo"
 export QT_GSTREAMER_PLAYBIN_AUDIOSINK=alsasink
 export QT_GSTREAMER_PLAYBIN_AUDIOSINK_DEVICE_PARAMETER=bluealsa:DEV=00:00:00:00:00:00
 cd /
 pkill -0 nickel && { echo "nickel already running"; exit 0; }
 
-if [ -n "$KG_DROP_WIFI" ] && grep -q "^${WIFI_MODULE} " /proc/modules; then
+if [ -n "$GHOSTTY_INK_DROP_WIFI" ] && grep -q "^${WIFI_MODULE} " /proc/modules; then
     dhcpcd -d -k "${INTERFACE}"
     killall -q -TERM udhcpc default.script
     wpa_cli -i "${INTERFACE}" terminate

@@ -1,17 +1,17 @@
-# Copy to ghostty.conf on the device (.adds/kobo-ghostty/ghostty.conf). Never commit the real file.
-# By default kgterm starts a local shell (BusyBox ash with history, see shrc). From there run e.g.
+# Copy to ghostty.conf on the device (.adds/ghostty-ink/ghostty.conf). Never commit the real file.
+# By default ghostty-ink starts a local shell (BusyBox ash with history, see shrc). From there run e.g.
 #     ssh user@host            (Up arrow / Ctrl+R recall earlier commands)
 # The bundled `ssh` is dropbear's dbclient with these rules:
-#  * Private key: /etc/kobo-ghostty/id_ed25519(.enc) on the root filesystem, NOT the USB-visible FAT partition.
-#    Create one with a passphrase: run  kg-newkey  in the Kobo shell (see README, "SSH keys").
-#  * Host keys are checked strictly against .adds/kobo-ghostty/home/.ssh/known_hosts (no auto-accept).
+#  * Private key: /etc/ghostty-ink/id_ed25519(.enc) on the root filesystem, NOT the USB-visible FAT partition.
+#    Create one with a passphrase: run  ssh-keygen  in the Kobo shell (then  ssh-copy-id user@host ) (see README, "SSH keys").
+#  * Host keys are checked strictly against /etc/ghostty-ink/home/.ssh/known_hosts (root filesystem) (no auto-accept).
 #  * Authorize the key on the server with restrictions, for example (one line):
-#      restrict,pty,from="<your LAN>/24",command="tmux -u new -A -s kobo" ssh-ed25519 <public key from dropbearkey -y> kobo-ghostty
+#      restrict,pty,from="<your LAN>/24",command="tmux -u new -A -s kobo" ssh-ed25519 <public key from dropbearkey -y> ghostty-ink
 #  * Use "tmux -u" on the server: dbclient forwards no locale, so without -u tmux replaces every
 #    non-ASCII glyph (icons, bullets, arrows) with "_".
 #
-# To start something other than the shell, set KG_CMD (a command line run by /bin/sh -c), for example
+# To start something other than the shell, set GHOSTTY_INK_CMD (a command line run by /bin/sh -c), for example
 # straight into ssh:
-# KG_CMD='dbclient -K 30 -i /etc/kobo-ghostty/id_ed25519 -t user@host'
-# kgterm options: -F font index, -M scale, -K keyboard name match, -C cols, -R rows
-KG_ARGS=""
+# GHOSTTY_INK_CMD='dbclient -K 30 -i /etc/ghostty-ink/id_ed25519 -t user@host'
+# ghostty-ink options: -F font index, -M scale, -K keyboard name match, -C cols, -R rows
+GHOSTTY_INK_ARGS=""

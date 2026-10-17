@@ -1,13 +1,13 @@
 #!/bin/sh
 # Stop Nickel and its helpers but leave Wi-Fi (wpa_supplicant + dhcpcd) and the Bluetooth
 # daemons (mtkbtd, btservice) running, so the paired keyboard and the network stay up.
-# Saves the env bits Nickel needs on restart to /tmp/kg-env (see nickel-start.sh).
+# Saves the env bits Nickel needs on restart to /tmp/ghostty-ink-env (see nickel-start.sh).
 PATH="/sbin:/bin:/usr/sbin:/usr/bin:/usr/lib:"
 pkill -0 nickel || { echo "nickel not running"; exit 0; }
 
 # Siphon the env rcS exported to Nickel (same set KOReader's koreader.sh uses, plus PLATFORM/PRODUCT).
 grep -s -a -E -e '^(DBUS_SESSION_BUS_ADDRESS|NICKEL_HOME|WIFI_MODULE|LANG|INTERFACE|PLATFORM|PRODUCT)=' \
-    "/proc/$(pidof -s nickel)/environ" | sed 's/^/export /' > /tmp/kg-env
+    "/proc/$(pidof -s nickel)/environ" | sed 's/^/export /' > /tmp/ghostty-ink-env
 
 sync
 killall -q -TERM nickel hindenburg sickel fickel strickel fontickel adobehost foxitpdf iink \

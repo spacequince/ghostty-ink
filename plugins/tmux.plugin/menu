@@ -1,0 +1,2 @@
+# Label|command typed into the terminal (and run) when chosen from the menu
+Attach or start tmux|tmux -u new -A -s kobo

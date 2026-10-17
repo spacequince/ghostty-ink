@@ -1,0 +1,9 @@
+# Label|keys sent when tapped. ^B is Ctrl+B (the tmux prefix), \e is Escape, \n is Enter.
+^B|^B
+new|^Bc
+next|^Bn
+prev|^Bp
+copy|^B[
+hsplit|^B"
+vsplit|^B%
+detach|^Bd

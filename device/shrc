@@ -1,11 +1,12 @@
-# kgterm interactive shell setup (BusyBox ash reads this through $ENV, set by ghostty.sh).
-D=/mnt/onboard/.adds/kobo-ghostty
+# ghostty-ink interactive shell setup (BusyBox ash reads this through $ENV, set by ghostty.sh).
+D="${GHOSTTY_INK_DIR:-/mnt/onboard/.adds/ghostty-ink}"
+S="${GHOSTTY_INK_STATE:-/etc/ghostty-ink}"     # keys, known_hosts and history (root filesystem, not the USB-visible partition)
 export PATH="$PATH:$D/bin"
 export TERM=xterm-256color
 
 # History: Up/Down, Ctrl+R to search. Kept on the root filesystem (not the USB-visible FAT partition)
 # because command lines can contain secrets.
-export HISTFILE=/etc/kobo-ghostty/ash_history
+export HISTFILE=$S/ash_history
 export HISTFILESIZE=2000
 
 PS1='\w \$ '
@@ -13,26 +14,44 @@ alias ll='ls -l'
 
 # ssh = the bundled dropbear client with the Kobo's key and keepalive. Host keys are checked strictly against
 # $HOME/.ssh/known_hosts (no auto-accept); add one once by connecting and answering the prompt.
-# A passphrase-protected key (id_ed25519.enc, see kg-newkey / kg-lockkey) is decrypted into RAM (/tmp) for the length of
+# A passphrase-protected key (id_ed25519.enc, see ssh-keygen) is decrypted into RAM (/tmp) for the length of
 # the connection only. dbclient itself cannot read encrypted keys.
-KG_KEY="${KG_KEY:-/etc/kobo-ghostty/id_ed25519}"
-rm -f /tmp/kgkey.* 2>/dev/null          # left over if an ssh was killed hard
+GHOSTTY_INK_KEY="${GHOSTTY_INK_KEY:-$S/id_ed25519}"
+rm -f /tmp/ghostty-ink-key.* 2>/dev/null          # left over if an ssh was killed hard
 ssh() {
-    if [ -f "$KG_KEY.enc" ]; then
+    local GHOSTTY_INK_KEY="$GHOSTTY_INK_KEY"
+    if [ "$1" = "-k" ]; then       # ssh -k name user@host  ->  /etc/ghostty-ink/id_name(.enc)
+        case "$2" in ""|*[!A-Za-z0-9_-]*) echo "ssh -k: need a key name (see ssh-keygen -l)"; return 1 ;; esac
+        GHOSTTY_INK_KEY="$S/id_$2"; shift 2
+        [ -e "$GHOSTTY_INK_KEY" ] || [ -e "$GHOSTTY_INK_KEY.enc" ] || { echo "No key named $GHOSTTY_INK_KEY (see ssh-keygen -l)"; return 1; }
+    fi
+    if [ -f "$GHOSTTY_INK_KEY.enc" ]; then
         (
             umask 077
-            k="/tmp/kgkey.$$"
+            k="/tmp/ghostty-ink-key.$$"
             trap 'rm -f "$k"' EXIT INT TERM HUP
-            kgkey dec "$KG_KEY.enc" > "$k" || exit 1
+            ghostty-ink-key dec "$GHOSTTY_INK_KEY.enc" > "$k" || exit 1
             dbclient -K 30 -i "$k" -t "$@"
         )
     else
-        dbclient -K 30 -i "$KG_KEY" -t "$@"
+        dbclient -K 30 -i "$GHOSTTY_INK_KEY" -t "$@"
     fi
 }
 # (aliases, not functions: BusyBox ash does not allow hyphens in function names)
-alias kg-newkey="sh $D/kg-keys.sh new"        # generate a key pair locked with a passphrase, print the public key
-alias kg-lockkey="sh $D/kg-keys.sh lock"      # put a passphrase on the existing key
-alias kg-pubkey="sh $D/kg-keys.sh pub"        # print the public key again
+alias ssh-keygen="sh $D/ssh-keygen.sh"        # Ghostty Ink's light ssh-keygen: new passphrase-protected key (-f NAME), -y public key, -l list, -p lock
+alias ssh-copy-id="sh $D/ssh-copy-id.sh"      # Ghostty Ink's light ssh-copy-id: put the public key on a server (-i NAME)
 
-echo "kgterm shell. Up arrow / Ctrl+R: history (e.g. your ssh command). Top button: menu."
+alias plugins="sh $D/plugins.sh"              # list / enable / disable plugins (see docs/plugins.md)
+
+# Plugins: the NAME.plugin folders in $D/plugins that are listed in $D/plugins/enabled (none by default) may add bin/ to
+# PATH and have their init.sh sourced here. Menu entries and keyboard keys are read by the terminal itself.
+for _p in "$D"/plugins/*.plugin; do
+    [ -d "$_p" ] || continue
+    _n="${_p##*/}"; _n="${_n%.plugin}"
+    grep -qx "$_n" "$D/plugins/enabled" 2>/dev/null || continue
+    [ -d "$_p/bin" ] && PATH="$PATH:$_p/bin"
+    [ -f "$_p/init.sh" ] && . "$_p/init.sh"
+done
+unset _p _n
+
+echo "ghostty-ink shell. Up arrow / Ctrl+R: history (e.g. your ssh command). Menu: the Menu key on the on-screen keyboard (or the top button on a Kobo)."
