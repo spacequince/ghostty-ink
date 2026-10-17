@@ -19,7 +19,7 @@ retry loop never weakens the security model (strict host keys, encrypted key at 
 
 ## Scope for 0.2.0
 
-1. **Distinct exit code for connection loss.** A small Dropbear patch (`third_party-patches/dropbear-exit-255.patch`, applied by
+1. **Distinct exit code for connection loss.** A small Dropbear patch (`patches/dropbear-exit-255.patch`, applied by
    `build-dropbear.sh`) makes `dbclient` exit with 255 for transport errors (keepalive timeout, reset, remote closed, connect
    failed), like OpenSSH. Remote command status and clean logout keep their own codes. This lets the wrapper tell "the link died"
    from "you typed `exit`" without parsing output.
