@@ -1,0 +1,2 @@
+menu_item:main:Ghostty terminal:nickel_bluetooth:enable
+chain_always:cmd_spawn:quiet:exec /bin/sh /mnt/onboard/.adds/kobo-ghostty/ghostty.sh

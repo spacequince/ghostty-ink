@@ -1,0 +1,17 @@
+[package]
+name = "kgkey"
+version = "0.1.0"
+edition = "2021"
+description = "Passphrase-protect an SSH private key at rest (age format) and decrypt it to stdout for one connection"
+
+[dependencies]
+age = "0.10"
+rpassword = "7"
+secrecy = "0.8"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

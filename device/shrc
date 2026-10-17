@@ -1,0 +1,38 @@
+# kgterm interactive shell setup (BusyBox ash reads this through $ENV, set by ghostty.sh).
+D=/mnt/onboard/.adds/kobo-ghostty
+export PATH="$PATH:$D/bin"
+export TERM=xterm-256color
+
+# History: Up/Down, Ctrl+R to search. Kept on the root filesystem (not the USB-visible FAT partition)
+# because command lines can contain secrets.
+export HISTFILE=/etc/kobo-ghostty/ash_history
+export HISTFILESIZE=2000
+
+PS1='\w \$ '
+alias ll='ls -l'
+
+# ssh = the bundled dropbear client with the Kobo's key and keepalive. Host keys are checked strictly against
+# $HOME/.ssh/known_hosts (no auto-accept); add one once by connecting and answering the prompt.
+# A passphrase-protected key (id_ed25519.enc, see kg-newkey / kg-lockkey) is decrypted into RAM (/tmp) for the length of
+# the connection only. dbclient itself cannot read encrypted keys.
+KG_KEY="${KG_KEY:-/etc/kobo-ghostty/id_ed25519}"
+rm -f /tmp/kgkey.* 2>/dev/null          # left over if an ssh was killed hard
+ssh() {
+    if [ -f "$KG_KEY.enc" ]; then
+        (
+            umask 077
+            k="/tmp/kgkey.$$"
+            trap 'rm -f "$k"' EXIT INT TERM HUP
+            kgkey dec "$KG_KEY.enc" > "$k" || exit 1
+            dbclient -K 30 -i "$k" -t "$@"
+        )
+    else
+        dbclient -K 30 -i "$KG_KEY" -t "$@"
+    fi
+}
+# (aliases, not functions: BusyBox ash does not allow hyphens in function names)
+alias kg-newkey="sh $D/kg-keys.sh new"        # generate a key pair locked with a passphrase, print the public key
+alias kg-lockkey="sh $D/kg-keys.sh lock"      # put a passphrase on the existing key
+alias kg-pubkey="sh $D/kg-keys.sh pub"        # print the public key again
+
+echo "kgterm shell. Up arrow / Ctrl+R: history (e.g. your ssh command). Top button: menu."
