@@ -13,6 +13,22 @@ keyboard (BT or on-screen) + touch -> evdev -> keymap -> libghostty-vt (terminal
                               pty <-> BusyBox shell -> ssh (dropbear dbclient) -> tmux
 ```
 
+## Screenshots
+
+Screenshots from a Kobo Libra Colour: tmux over SSH with the on-screen keyboard, the same session full screen after
+swiping the keyboard away, Neovim, and the menu.
+
+<table>
+<tr>
+<td><img src="docs/img/shell-keyboard.png" alt="tmux with three panes and the on-screen keyboard" width="400"></td>
+<td><img src="docs/img/shell-fullscreen.png" alt="the same tmux window full screen, keyboard hidden" width="400"></td>
+</tr>
+<tr>
+<td><img src="docs/img/editor.png" alt="Neovim in a tmux window" width="400"></td>
+<td><img src="docs/img/menu.png" alt="the Ghostty Ink menu" width="400"></td>
+</tr>
+</table>
+
 The terminal core is [libghostty-vt](https://github.com/ghostty-org/ghostty) (Ghostty's VT parser, screen and scrollback
 state, as a C library). Everything else is ours: `src/ghostty-ink.c`.
 
