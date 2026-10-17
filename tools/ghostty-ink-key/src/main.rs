@@ -1,7 +1,7 @@
-//! kgkey: protect an SSH private key with a passphrase, using the age format (scrypt + ChaCha20-Poly1305).
+//! ghostty-ink-key: protect an SSH private key with a passphrase, using the age format (scrypt + ChaCha20-Poly1305).
 //!
-//!   kgkey enc <plain-key-file> <encrypted-file>   prompts twice for a new passphrase (on /dev/tty, no echo)
-//!   kgkey dec <encrypted-file>                    prompts once, writes the key to stdout
+//!   ghostty-ink-key enc <plain-key-file> <encrypted-file>   prompts twice for a new passphrase (on /dev/tty, no echo)
+//!   ghostty-ink-key dec <encrypted-file>                    prompts once, writes the key to stdout
 //!
 //! Dropbear's dbclient cannot read passphrase-protected keys, so the Kobo's `ssh` helper keeps the key encrypted at
 //! rest and decrypts it into RAM (tmpfs) only while a connection is open. No custom cryptography: all of it is the `age`
@@ -35,7 +35,7 @@ fn prompt(msg: &str) -> Secret<String> {
 }
 
 fn die(msg: &str) -> ! {
-    eprintln!("kgkey: {msg}");
+    eprintln!("ghostty-ink-key: {msg}");
     std::process::exit(1)
 }
 
@@ -62,7 +62,7 @@ fn main() {
             std::io::stdout().write_all(&plain).unwrap_or_else(|e| die(&e.to_string()));
         }
         _ => {
-            eprintln!("usage: kgkey enc <plain-key> <encrypted-file> | kgkey dec <encrypted-file>");
+            eprintln!("usage: ghostty-ink-key enc <plain-key> <encrypted-file> | ghostty-ink-key dec <encrypted-file>");
             std::process::exit(64);
         }
     }

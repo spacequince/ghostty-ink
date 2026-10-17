@@ -1,5 +1,5 @@
-// kgterm: a terminal for the Kobo. libghostty-vt (VT state) + FBInk (e-ink drawing) + evdev keyboard + pty.
-// Usage: kgterm [-F font_index] [-M mult] [-K kbd_name_substr] [-C cols] [-R rows] [-q] -- cmd [args...]
+// ghostty-ink: a terminal for the Kobo. libghostty-vt (VT state) + FBInk (e-ink drawing) + evdev keyboard + pty.
+// Usage: ghostty-ink [-F font_index] [-M mult] [-K kbd_name_substr] [-C cols] [-R rows] [-X plugins_dir] [-q] -- cmd [args...]
 // Environment: TERM=xterm-256color is set for the child.
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -48,13 +48,19 @@ static int kfd[MAXDEV] = {-1, -1, -1, -1, -1, -1, -1, -1};   /* -1 = free slot *
 static char kpath[MAXDEV][32];
 static int nk;
 static const char *kbd_match = NULL;
+// Auto orientation: read the accelerometer's sysfs "xyz" (Kobo kx122: gravity along the panel axes, ~16000 = 1 g).
+static char acc_dir[96];                   // /sys/class/input/eventN/device of the accelerometer, "" when there is none
+static int rot_auto, rot_manual = -1, rot_auto_last = -1, rot_pending = -1;
+static double rot_pend_t;
 static int bfd = -1;                       // gpio-keys (page-turn buttons)
 static int tfd = -1, pfd = -1;             // touchscreen, power key
+static int t_single;                       // touch panel reports ABS_X/ABS_Y + BTN_TOUCH instead of multi-touch slots
 static int tmaxx = 1, tmaxy = 1;           // touch axis ranges
 static const char *inject_path;            // -I fifo: bytes written there are typed into the pty (debugging)
 static int ifd = -1;
 static int btn_exit = 193, btn_bottom = 194; // evdev codes; override with -T/-D (all button events are logged)
 
+static FBInkState fst;
 static int has(const unsigned char *b, int bit) { return b[bit / 8] & (1 << (bit % 8)); }
 
 static void scan_keyboards(void) {
@@ -74,23 +80,39 @@ static void scan_keyboards(void) {
 		char name[64] = "";
 		ioctl(fd, EVIOCGBIT(EV_KEY, sizeof keys), keys);
 		ioctl(fd, EVIOCGNAME(sizeof name), name);
+		if (strstr(name, "accel")) {
+			char xyz[140];
+			snprintf(xyz, sizeof xyz, "/sys/class/input/%s/device/xyz", e->d_name);
+			if (!acc_dir[0] && access(xyz, R_OK) == 0) {
+				snprintf(acc_dir, sizeof acc_dir, "/sys/class/input/%s/device", e->d_name);
+				LOG("accelerometer %s (%s)", name, acc_dir);
+			}
+			close(fd);
+			continue;
+		}
 		if (!strncmp(name, "gpio-keys", 9)) {
 			// The page-turn buttons: top = exit, bottom = Morse keyboard (see handle_button).
 			if (bfd < 0) { ioctl(fd, EVIOCGRAB, 1); bfd = fd; LOG("grabbed buttons %s (%s)", name, path); }
 			else close(fd);
 			continue;
 		}
-		if (strstr(name, "Touchscreen")) {
+		unsigned char abs[BITS(ABS_MAX + 1)] = {0};
+		ioctl(fd, EVIOCGBIT(EV_ABS, sizeof abs), abs);
+		int mt = has(abs, ABS_MT_POSITION_X) && has(abs, ABS_MT_POSITION_Y);
+		int st = has(abs, ABS_X) && has(abs, ABS_Y) && has(keys, BTN_TOUCH);   // single-touch panel (some Kindles)
+		if (strstr(name, "Touchscreen") || mt || st) {
 			if (tfd < 0) {
 				struct input_absinfo ai;
-				if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &ai) == 0) tmaxx = ai.maximum > 0 ? ai.maximum : 1;
-				if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &ai) == 0) tmaxy = ai.maximum > 0 ? ai.maximum : 1;
+				int ax = mt ? ABS_MT_POSITION_X : ABS_X, ay = mt ? ABS_MT_POSITION_Y : ABS_Y;
+				if (ioctl(fd, EVIOCGABS(ax), &ai) == 0) tmaxx = ai.maximum > 0 ? ai.maximum : 1;
+				if (ioctl(fd, EVIOCGABS(ay), &ai) == 0) tmaxy = ai.maximum > 0 ? ai.maximum : 1;
+				t_single = !mt;
 				ioctl(fd, EVIOCGRAB, 1); tfd = fd;
-				LOG("grabbed touchscreen %s (%s) max %dx%d", name, path, tmaxx, tmaxy);
+				LOG("grabbed touchscreen %s (%s) max %dx%d%s", name, path, tmaxx, tmaxy, t_single ? " (single-touch)" : "");
 			} else close(fd);
 			continue;
 		}
-		if (strstr(name, "pwrkey")) {
+		if (strstr(name, "pwrkey") || (has(keys, KEY_POWER) && !has(keys, KEY_A))) {
 			if (pfd < 0) { ioctl(fd, EVIOCGRAB, 1); pfd = fd; LOG("grabbed power key %s (%s)", name, path); }
 			else close(fd);
 			continue;
@@ -296,13 +318,13 @@ static int put_utf8(char *o, uint32_t cp) {
 
 static bool use_ttf;
 static bool glyph_binary;   // draw 1-bit glyphs (fast DU refreshes); the quality pass redraws anti-aliased
-static unsigned char *ttf_data[3];     // regular, bold, symbols
-static stbtt_fontinfo ttf_fi[3];
-static bool have_bold_font, have_sym_font;
+static unsigned char *ttf_data[4];     // regular, bold, symbols, emoji (monochrome outlines, e.g. Noto Emoji)
+static stbtt_fontinfo ttf_fi[4];
+static bool have_bold_font, have_sym_font, have_emoji_font;
 static float ttf_scale[2], sym_scale;
 static int sym_yadj;
 static int cell_w, cell_h, ascent_px, ttf_px = 30;
-static const char *font_reg_path, *font_bold_path, *font_sym_path;
+static const char *font_reg_path, *font_bold_path, *font_sym_path, *font_emoji_path;
 static unsigned char *fbmem;
 static size_t fbmem_size;
 static int fb_stride, scr_w, scr_h, lw, lh, grid_ox, grid_oy, rotation;
@@ -358,12 +380,15 @@ static bool ttf_init(void) {
 	if (font_sym_path && (ttf_data[2] = slurp(font_sym_path)) &&
 	    stbtt_InitFont(&ttf_fi[2], ttf_data[2], stbtt_GetFontOffsetForIndex(ttf_data[2], 0)))
 		have_sym_font = true;
+	if (font_emoji_path && (ttf_data[3] = slurp(font_emoji_path)) &&
+	    stbtt_InitFont(&ttf_fi[3], ttf_data[3], stbtt_GetFontOffsetForIndex(ttf_data[3], 0)))
+		have_emoji_font = true;
 	for (int i = 0; i < 256; i++) gamma_lut[i] = (uint8_t)(255.0 * __builtin_pow(i / 255.0, 0.75) + 0.5);
 	return ttf_metrics();
 }
 
-static Glyph *get_glyph(uint32_t cp, bool bold) {
-	uint32_t key = ((cp << 1) | bold) + 1;
+static Glyph *get_glyph(uint32_t cp, bool bold, int ncells) {
+	uint32_t key = (((cp | (ncells == 2 ? 1u << 24 : 0)) << 1) | bold) + 1;
 	uint32_t h = (key * 2654435761u) % GCACHE;
 	for (int probe = 0; probe < GCACHE; probe++, h = (h + 1) % GCACHE) {
 		Glyph *g = &gcache[h];
@@ -373,15 +398,28 @@ static Glyph *get_glyph(uint32_t cp, bool bold) {
 		float sc = 0;
 		int yadj = 0, gi = 0;
 		bool synth = false;
+		int xadj_emoji = 0;
 		if (bold && have_bold_font && (gi = stbtt_FindGlyphIndex(&ttf_fi[1], cp))) { fi = &ttf_fi[1]; sc = ttf_scale[1]; }
 		else if ((gi = stbtt_FindGlyphIndex(&ttf_fi[0], cp))) { fi = &ttf_fi[0]; sc = ttf_scale[0]; synth = bold; }
 		else if (have_sym_font && (gi = stbtt_FindGlyphIndex(&ttf_fi[2], cp))) { fi = &ttf_fi[2]; sc = sym_scale; yadj = sym_yadj; }
+		else if (have_emoji_font && (gi = stbtt_FindGlyphIndex(&ttf_fi[3], cp))) {
+			// Emoji: fit the glyph's box into 1 or 2 cells (square), centred, whatever the font's own proportions
+			fi = &ttf_fi[3];
+			int ex0, ey0, ex1, ey1;
+			stbtt_GetGlyphBitmapBox(fi, gi, 1.0f, 1.0f, &ex0, &ey0, &ex1, &ey1);
+			float bw = ex1 - ex0 > 0 ? ex1 - ex0 : 1, bh = ey1 - ey0 > 0 ? ey1 - ey0 : 1;
+			float box = (float)(ncells * cell_w < cell_h ? ncells * cell_w : cell_h) * 0.92f;
+			sc = box / (bw > bh ? bw : bh);
+			stbtt_GetGlyphBitmapBox(fi, gi, sc, sc, &ex0, &ey0, &ex1, &ey1);
+			yadj = (cell_h - (ey1 - ey0)) / 2 - (ascent_px + ey0);                 // vertical centre in the cell
+			xadj_emoji = (ncells * cell_w - (ex1 - ex0)) / 2 - ex0;                 // horizontal centre in the cell(s)
+		}
 		else { fi = &ttf_fi[0]; sc = ttf_scale[0]; gi = 0; }   // missing everywhere: regular .notdef
 		int x0, y0, x1, y1;
 		stbtt_GetGlyphBitmapBox(fi, gi, sc, sc, &x0, &y0, &x1, &y1);
 		int w = x1 - x0, hh = y1 - y0;
 		{ static int nlog; if (cp > 0x7f && nlog < 80) { nlog++; LOG("glyph U+%04X bold=%d font=%d gi=%d box %dx%d off %d,%d scale %.3f", cp, bold, fi == &ttf_fi[2] ? 2 : fi == &ttf_fi[1] ? 1 : 0, gi, w, hh, x0, y0, sc); } }
-		g->key = key; g->xoff = x0; g->yoff = y0 + yadj;
+		g->key = key; g->xoff = x0 + xadj_emoji; g->yoff = y0 + yadj;
 		if (w <= 0 || hh <= 0) { g->w = g->h = 0; g->cov = NULL; return g; }
 		int ww = w + (synth ? 1 : 0);
 		uint8_t *buf = calloc(ww, hh);
@@ -438,20 +476,21 @@ static void fill_fb(GhosttyColorRgb c) {
 	}
 }
 
-static void draw_cell(int col, int row, uint32_t cp, GhosttyColorRgb fg, GhosttyColorRgb bg, bool bold, int underline, bool strike) {
+static void draw_cell_n(int col, int row, uint32_t cp, GhosttyColorRgb fg, GhosttyColorRgb bg, bool bold, int underline, bool strike, int ncells) {
 	int x0 = grid_ox + col * cell_w, y0 = grid_oy + row * cell_h;
-	if (x0 < 0 || y0 < 0 || x0 + cell_w > lw || y0 + cell_h > lh) return;
+	int cw = cell_w * ncells;
+	if (x0 < 0 || y0 < 0 || x0 + cw > lw || y0 + cell_h > lh) return;
 	uint32_t bgp = pack_rgb(bg.r, bg.g, bg.b), fgp = pack_rgb(fg.r, fg.g, fg.b);
 	for (int yy = 0; yy < cell_h; yy++)
-		for (int xx = 0; xx < cell_w; xx++) *pix(x0 + xx, y0 + yy) = bgp;
+		for (int xx = 0; xx < cw; xx++) *pix(x0 + xx, y0 + yy) = bgp;
 	if (cp > 0x20) {
-		Glyph *g = get_glyph(cp, bold);
+		Glyph *g = get_glyph(cp, bold, ncells);
 		for (int yy = 0; yy < g->h; yy++) {
 			int py = ascent_px + g->yoff + yy;
 			if (py < 0 || py >= cell_h) continue;
 			for (int xx = 0; xx < g->w; xx++) {
 				int px = g->xoff + xx;
-				if (px < 0 || px >= cell_w) continue;
+				if (px < 0 || px >= cw) continue;
 				int a = g->cov[yy * g->w + xx];
 				if (glyph_binary) a = a >= 110 ? 255 : 0;
 				if (!a) continue;
@@ -460,15 +499,28 @@ static void draw_cell(int col, int row, uint32_t cp, GhosttyColorRgb fg, Ghostty
 			}
 		}
 	}
-	if (underline) for (int xx = 0; xx < cell_w; xx++) {
+	if (underline) for (int xx = 0; xx < cw; xx++) {
 		int py = ascent_px + 3;
 		if (py < cell_h) *pix(x0 + xx, y0 + py) = fgp;
 	}
-	if (strike) for (int xx = 0; xx < cell_w; xx++)
+	if (strike) for (int xx = 0; xx < cw; xx++)
 		*pix(x0 + xx, y0 + ascent_px * 55 / 100) = fgp;
 }
 
-#define FLASH_AFTER_ROWS 160     // rows redrawn since the last flashing clean-up before another is worth it
+static void draw_cell(int col, int row, uint32_t cp, GhosttyColorRgb fg, GhosttyColorRgb bg, bool bold, int underline, bool strike) {
+	draw_cell_n(col, row, cp, fg, bg, bold, underline, strike, 1);
+}
+
+// ---- refresh settings (menu: Refresh), persisted in settings.conf ----
+static int rf_wfm = 0;              // typing waveform: 0 DU (fast, 1-bit glyphs), 1 A2 (fastest), 2 GL16 (smooth, anti-aliased at once)
+static int rf_batch_ms = 60;        // changes are collected for this long before one refresh
+static int rf_quality_ms = 600;     // idle time before the anti-aliased clean-up pass (0 = never)
+static int rf_flash_rows = 160;     // rows redrawn before a long idle ends in a flashing clean-up (0 = never)
+static const int rf_batch_opts[] = {30, 60, 120, 250};
+static const int rf_quality_opts[] = {0, 300, 600, 1500, 3000};
+static const int rf_flash_opts[] = {0, 80, 160, 400};
+#define NOPTS(a) ((int)(sizeof(a) / sizeof *(a)))
+static WFM_MODE_INDEX_T typing_wfm(void) { return rf_wfm == 1 ? WFM_A2 : rf_wfm == 2 ? WFM_GL16 : WFM_DU; }
 #define MAXROWS 512
 static bool rr[MAXROWS];            // rows drawn since the last refresh (refreshed as separate runs)
 static bool rr_any;
@@ -486,17 +538,18 @@ static int draw(bool force_all) {
 	if (ghostty_render_state_update(rs, term) != GHOSTTY_SUCCESS) return 0;
 	GhosttyRenderStateDirty dirty;
 	ghostty_render_state_get(rs, GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
-	if (dirty == GHOSTTY_RENDER_STATE_DIRTY_FALSE && !force_all && extra_dirty_row < 0 && !q_force) return 0;
-	glyph_binary = use_ttf && !aa_pass;
+	GhosttyRenderStateCursor cur = GHOSTTY_INIT_SIZED(GhosttyRenderStateCursor);
+	ghostty_render_state_get(rs, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cur);
+	int cx = -1, cy = -1;
+	if (cur.visible && cur.viewport_has_value) { cx = cur.viewport_x; cy = cur.viewport_y; }
+	// a cursor-only move (arrow keys) does not mark any row dirty, but the cursor still has to be redrawn
+	if (dirty == GHOSTTY_RENDER_STATE_DIRTY_FALSE && !force_all && extra_dirty_row < 0 && !q_force && cx == cur_x && cy == cur_y) return 0;
+	glyph_binary = use_ttf && !aa_pass && rf_wfm != 2;
 
 	GhosttyRenderStateColors colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
 	ghostty_render_state_get(rs, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors);
 	defbg = colors.background; deffg = colors.foreground;
 
-	GhosttyRenderStateCursor cur = GHOSTTY_INIT_SIZED(GhosttyRenderStateCursor);
-	ghostty_render_state_get(rs, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cur);
-	int cx = -1, cy = -1;
-	if (cur.visible && cur.viewport_has_value) { cx = cur.viewport_x; cy = cur.viewport_y; }
 	bool cursor_moved = cx != cur_x || cy != cur_y;
 
 	ghostty_render_state_get(rs, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &rowit);
@@ -554,9 +607,15 @@ static int draw(bool force_all) {
 			}
 			if (use_ttf) {
 				bool colored = memcmp(&bg_orig, &defbg, 3) != 0 || st.inverse;
-				glyph_binary = !aa_pass && !colored;
+				glyph_binary = !aa_pass && !colored && rf_wfm != 2;
 				rowslow |= colored; rowbin |= glyph_binary;
-				draw_cell(x, y, cp0, fg, bg, st.bold, st.underline, st.strikethrough);
+				GhosttyCell raw = 0;
+				int wide = GHOSTTY_CELL_WIDE_NARROW;
+				if (ghostty_render_state_row_cells_get(rowcells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw) == GHOSTTY_SUCCESS)
+					ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
+				if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD) { x++; if (x >= cols) break; continue; }   // the wide cell before it drew both halves
+				if (wide == GHOSTTY_CELL_WIDE_WIDE && x + 1 < cols) draw_cell_n(x, y, cp0, fg, bg, st.bold, st.underline, st.strikethrough, 2);
+				else draw_cell(x, y, cp0, fg, bg, st.bold, st.underline, st.strikethrough);
 				x++;
 				if (x >= cols) break;
 				continue;
@@ -670,6 +729,20 @@ static int touch_mode = 2;            // 0 off, 1 scroll only, 2 scroll + mouse 
 static int scroll_natural = 1;        // finger drags content (down = look at older output)
 static int theme_idx;                 // 0 light, 1 dark
 static bool locked, menu_open;
+static int osk_mode;                  // on-screen keyboard: 0 auto (shown while no Bluetooth keyboard is connected), 1 always, 2 never
+static bool osk_visible;
+static bool plug_dirty;               // the plugin set changed (keyboard keys added/removed) while the menu was open
+// two-finger swipe gestures (Menu > Touch): what each does
+enum { GA_NONE, GA_SHOW_KB, GA_HIDE_KB, GA_CLEAR, GA_MENU, GA_COUNT };
+static const char *gesture_names[GA_COUNT] = {"Nothing", "Show keyboard", "Hide keyboard", "Clear ghosting", "Open menu"};
+static int gest_up = GA_SHOW_KB, gest_down = GA_HIDE_KB;
+static int osk_y0, osk_h;             // top edge and height (logical pixels) of the keyboard; osk_h = 0 when hidden
+static bool osk_new;                  // set on every keyboard touch (restarts the idle timer)
+static bool osk_act;                  // keyboard was touched: schedule the quality pass
+static int osk_layout(void);
+static void osk_draw_all(void);
+static void osk_quality(void);
+static void refresh_rect(WFM_MODE_INDEX_T wfm, int lx, int ly, int w, int h, bool flash);
 
 static bool mode_on(GhosttyMode m) {
 	GhosttyTerminalModeConfig mc = {0};
@@ -683,7 +756,10 @@ static void compute_geometry(void) {
 	lw = sideways ? scr_h : scr_w;
 	lh = sideways ? scr_w : scr_h;
 	cols = forced_cols ? forced_cols : lw / cell_w;
-	rows = forced_rows ? forced_rows : lh / cell_h;
+	osk_h = osk_visible ? osk_layout() : 0;
+	osk_y0 = lh - osk_h;
+	rows = forced_rows ? forced_rows : (lh - osk_h) / cell_h;
+	if (rows < 4) rows = 4;
 	if (rows >= MAXROWS) rows = MAXROWS - 1;
 	grid_ox = (lw - cols * cell_w) / 2;
 	grid_oy = 0;
@@ -691,12 +767,18 @@ static void compute_geometry(void) {
 
 static void settings_save(void) {
 	if (!settings_path) return;
-	FILE *f = fopen(settings_path, "w");
+	char tmp[300];
+	snprintf(tmp, sizeof tmp, "%s.tmp", settings_path);
+	FILE *f = fopen(tmp, "w");
 	if (!f) return;
-	fprintf(f, "rotation=%d\npx=%d\ntouch=%d\nscroll_natural=%d\ntheme=%d\ncolors=%d\n", rotation, ttf_px, touch_mode, scroll_natural, theme_idx, color_mode);
+	fprintf(f, "version=2\n");
+	fprintf(f, "rotation=%d\nrotation_auto=%d\nauto_rotation=%d\npx=%d\ntouch=%d\nscroll_natural=%d\ntheme=%d\ncolors=%d\n", rot_manual >= 0 ? rot_manual : rotation, rot_auto, rot_auto_last >= 0 ? rot_auto_last : rotation, ttf_px, touch_mode, scroll_natural, theme_idx, color_mode);
+	fprintf(f, "keyboard=%d\nrefresh_wfm=%d\nrefresh_batch_ms=%d\nrefresh_quality_ms=%d\nrefresh_flash_rows=%d\n", osk_mode, rf_wfm, rf_batch_ms, rf_quality_ms, rf_flash_rows);
+	fprintf(f, "gesture_up=%d\ngesture_down=%d\n", gest_up, gest_down);
 	if (set_bright >= 0) fprintf(f, "brightness=%d\n", set_bright);
 	if (set_warm >= 0) fprintf(f, "warmth=%d\n", set_warm);
 	fflush(f); fsync(fileno(f)); fclose(f);
+	rename(tmp, settings_path);          // atomic: a power cut leaves the old file, never a half-written one
 }
 
 static void settings_load(bool px_cli, bool rot_cli) {
@@ -706,15 +788,26 @@ static void settings_load(bool px_cli, bool rot_cli) {
 	int v;
 	while (fgets(l, sizeof l, f)) {
 		if (sscanf(l, "rotation=%d", &v) == 1 && !rot_cli && (v == 0 || v == 90 || v == 180 || v == 270)) rotation = v;
+		else if (sscanf(l, "rotation_auto=%d", &v) == 1) rot_auto = v != 0;
+		else if (sscanf(l, "auto_rotation=%d", &v) == 1 && (v == 0 || v == 90 || v == 180 || v == 270)) rot_auto_last = v;
 		else if (sscanf(l, "px=%d", &v) == 1 && !px_cli && v >= 16 && v <= 64) ttf_px = v;
 		else if (sscanf(l, "touch=%d", &v) == 1 && v >= 0 && v <= 2) touch_mode = v;
 		else if (sscanf(l, "scroll_natural=%d", &v) == 1) scroll_natural = v != 0;
 		else if (sscanf(l, "theme=%d", &v) == 1 && v >= 0 && v <= 1) theme_idx = v;
 		else if (sscanf(l, "colors=%d", &v) == 1 && v >= 0 && v <= 3) color_mode = v;
+		else if (sscanf(l, "gesture_up=%d", &v) == 1 && v >= 0 && v < GA_COUNT) gest_up = v;
+		else if (sscanf(l, "gesture_down=%d", &v) == 1 && v >= 0 && v < GA_COUNT) gest_down = v;
+		else if (sscanf(l, "keyboard=%d", &v) == 1 && v >= 0 && v <= 2) osk_mode = v;
+		else if (sscanf(l, "refresh_wfm=%d", &v) == 1 && v >= 0 && v <= 2) rf_wfm = v;
+		else if (sscanf(l, "refresh_batch_ms=%d", &v) == 1 && v >= 10 && v <= 2000) rf_batch_ms = v;
+		else if (sscanf(l, "refresh_quality_ms=%d", &v) == 1 && v >= 0 && v <= 20000) rf_quality_ms = v;
+		else if (sscanf(l, "refresh_flash_rows=%d", &v) == 1 && v >= 0 && v <= 5000) rf_flash_rows = v;
 		else if (sscanf(l, "brightness=%d", &v) == 1 && v >= 0 && v <= 100) set_bright = v;
 		else if (sscanf(l, "warmth=%d", &v) == 1 && v >= 0 && v <= 100) set_warm = v;
 	}
 	fclose(f);
+	rot_manual = rotation;
+	if (rot_auto && rot_auto_last >= 0 && !rot_cli) rotation = rot_auto_last;   // start where the sensor last left it
 }
 
 // Frontlight (Kobo Libra Colour / "monza": white LEDs via mxc_msp430, warmth via the lm3630a mixer, inverted).
@@ -732,10 +825,42 @@ static void sysfs_write(const char *pth, int v) {
 	FILE *f = fopen(pth, "w");
 	if (f) { fprintf(f, "%d\n", v); fclose(f); }
 }
-static int fl_bright(void) { return sysfs_read(FL_WHITE); }
-static int fl_warm_pct(void) { int raw = sysfs_read(FL_COLOR); return raw < 0 ? -1 : (10 - raw) * 10; }
-static void fl_set_bright(int v) { sysfs_write(FL_WHITE, v < 0 ? 0 : v > 100 ? 100 : v); }
-static void fl_set_warm(int pct) { int raw = 10 - (pct + 5) / 10; sysfs_write(FL_COLOR, raw < 0 ? 0 : raw > 10 ? 10 : raw); }
+// Other devices (Kindle): the first /sys/class/backlight entry with brightness + max_brightness, scaled to 0-100. No warmth control.
+static char fl_alt[160];
+static int fl_alt_max;
+static void fl_probe(void) {
+	static bool done;
+	if (done) return;
+	done = true;
+	if (sysfs_read(FL_WHITE) >= 0) return;
+	DIR *d = opendir("/sys/class/backlight");
+	struct dirent *e;
+	while (d && (e = readdir(d))) {
+		if (e->d_name[0] == '.') continue;
+		char pth[200];
+		snprintf(pth, sizeof pth, "/sys/class/backlight/%s/max_brightness", e->d_name);
+		int mx = sysfs_read(pth);
+		if (mx <= 0) continue;
+		snprintf(fl_alt, sizeof fl_alt, "/sys/class/backlight/%s/brightness", e->d_name);
+		fl_alt_max = mx;
+		LOG("frontlight %s (max %d)", fl_alt, mx);
+		break;
+	}
+	if (d) closedir(d);
+}
+static int fl_bright(void) {
+	fl_probe();
+	if (!fl_alt_max) return sysfs_read(FL_WHITE);
+	int v = sysfs_read(fl_alt);
+	return v < 0 ? -1 : (v * 100 + fl_alt_max / 2) / fl_alt_max;
+}
+static int fl_warm_pct(void) { fl_probe(); if (fl_alt_max) return -1; int raw = sysfs_read(FL_COLOR); return raw < 0 ? -1 : (10 - raw) * 10; }
+static void fl_set_bright(int v) {
+	fl_probe();
+	v = v < 0 ? 0 : v > 100 ? 100 : v;
+	if (fl_alt_max) sysfs_write(fl_alt, (v * fl_alt_max + 50) / 100); else sysfs_write(FL_WHITE, v);
+}
+static void fl_set_warm(int pct) { fl_probe(); if (fl_alt_max) return; int raw = 10 - (pct + 5) / 10; sysfs_write(FL_COLOR, raw < 0 ? 0 : raw > 10 ? 10 : raw); }
 static int fl_level_index(int v) {
 	int best = 0;
 	for (int i = 0; i < NLEV; i++) if (abs(fl_levels[i] - v) < abs(fl_levels[best] - v)) best = i;
@@ -769,7 +894,12 @@ static void apply_theme(void) {
 }
 
 // Redraw the whole screen anti-aliased; flash = clear ghosting (and the margins) with a flashing refresh.
+static void apply_geometry(void);
 static void redraw_all(bool flash) {
+	if (plug_dirty && !menu_open) {      // plugin keys were switched on/off: the keyboard height changed
+		plug_dirty = false;
+		if (osk_visible) { apply_geometry(); return; }
+	}
 	if (flash) fill_fb(defbg);
 	aa_pass = true;
 	draw(true);
@@ -777,9 +907,16 @@ static void redraw_all(bool flash) {
 	memset(q_rows, 0, sizeof q_rows);
 	memset(slow_row, 0, sizeof slow_row);
 	q_any = false; burst_slow = 0;
+	if (osk_visible) osk_draw_all();
+	if (flash && osk_visible) {          // one flash for the whole screen rather than one per part
+		memset(rr, 0, sizeof rr); rr_any = false;
+		refresh_rect(WFM_GC16, 0, 0, lw, lh, true);
+		return;
+	}
 	refresh_flash = flash;
 	refresh_dirty(WFM_GC16, true);
 	refresh_flash = false;
+	if (osk_visible) refresh_rect(WFM_GC16, 0, osk_y0, lw, osk_h, false);
 }
 
 static GhosttyMouseEncoder menc;
@@ -810,13 +947,458 @@ static void apply_geometry(void) {
 	redraw_all(true);
 }
 
+// ---- plugins (see docs/plugins.md): menu entries and extra keyboard keys read from <plugins dir>/NAME.plugin/ ----
+// A plugin folder may hold  menu  (lines "Label|command": typed into the terminal and run) and  osk  (lines
+// "Label|keys": an extra key on the on-screen keyboard that sends the keys; ^X is Ctrl+X, \e Escape, \n Enter, \t Tab,
+// \\ a backslash). bin/ and init.sh are used by the shell (shrc). Plugins are off until listed in <plugins dir>/enabled.
+#include <ctype.h>
+#define MAX_PMENU 12
+#define MAX_MACRO 16
+static const char *plugins_dir;
+static struct { char label[40]; char cmd[200]; } pmenu[MAX_PMENU];
+static int npmenu;
+static struct { char label[16]; char seq[64]; } macro[MAX_MACRO];
+static int nmacro;
+
+static void unescape_keys(const char *in, char *out, size_t n) {
+	size_t o = 0;
+	for (; *in && o + 1 < n; in++) {
+		if (*in == '\\' && in[1]) {
+			in++;
+			out[o++] = *in == 'e' ? 27 : *in == 'n' ? '\r' : *in == 't' ? '\t' : *in;
+		} else if (*in == '^' && in[1]) { in++; out[o++] = (char)(toupper((unsigned char)*in) & 0x1f); }
+		else out[o++] = *in;
+	}
+	out[o] = 0;
+}
+
+static int cmp_str(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+
+typedef struct { char dir[72]; char name[40]; bool enabled; } Plugin;
+#define MAX_PLUGINS 12
+static Plugin plugs[MAX_PLUGINS];
+static int nplugs;
+
+// Which plugins are on is kept in <plugins dir>/enabled, one plugin name (the folder name without ".plugin") per line.
+// No file means every plugin is off. The shell side (shrc, plugins.sh) reads the same file.
+static bool plugin_listed(const char *base) {
+	char path[300], line[100];
+	bool on = false;
+	snprintf(path, sizeof path, "%s/enabled", plugins_dir);
+	FILE *f = fopen(path, "r");
+	if (!f) return false;
+	while (fgets(line, sizeof line, f)) {
+		line[strcspn(line, "\r\n")] = 0;
+		if (!strcmp(line, base)) on = true;
+	}
+	fclose(f);
+	return on;
+}
+
+static void plugin_name(const char *dir, char *out, size_t n) {
+	char path[300], line[160];
+	snprintf(out, n, "%.*s", (int)(strlen(dir) - 7), dir);
+	snprintf(path, sizeof path, "%s/%s/plugin.conf", plugins_dir, dir);
+	FILE *f = fopen(path, "r");
+	if (!f) return;
+	while (fgets(line, sizeof line, f))
+		if (!strncmp(line, "name=", 5)) { line[strcspn(line, "\r\n")] = 0; if (line[5]) snprintf(out, n, "%s", line + 5); }
+	fclose(f);
+}
+
+// (Re)read the plugins folder: every NAME.plugin is listed; only the ones named in the enabled file add menu entries and keys.
+static void plugins_load(void) {
+	npmenu = nmacro = nplugs = 0;
+	if (!plugins_dir) return;
+	DIR *d = opendir(plugins_dir);
+	if (!d) return;
+	char *names[64];
+	int nn = 0;
+	struct dirent *e;
+	while ((e = readdir(d)) && nn < 64) {
+		size_t l = strlen(e->d_name);
+		if (l > 7 && !strcmp(e->d_name + l - 7, ".plugin")) names[nn++] = strdup(e->d_name);
+	}
+	closedir(d);
+	qsort(names, nn, sizeof *names, cmp_str);
+	for (int i = 0; i < nn; i++) {
+		char base[72];
+		snprintf(base, sizeof base, "%.*s", (int)(strlen(names[i]) - 7), names[i]);
+		bool enabled = plugin_listed(base);
+		if (nplugs < MAX_PLUGINS) {
+			snprintf(plugs[nplugs].dir, sizeof plugs[0].dir, "%s", names[i]);
+			plugs[nplugs].enabled = enabled;
+			plugin_name(names[i], plugs[nplugs].name, sizeof plugs[0].name);
+			nplugs++;
+		}
+		for (int kind = 0; kind < 2 && enabled; kind++) {
+			char path[300], line[300];
+			snprintf(path, sizeof path, "%s/%s/%s", plugins_dir, names[i], kind ? "osk" : "menu");
+			FILE *f = fopen(path, "r");
+			if (!f) continue;
+			while (fgets(line, sizeof line, f)) {
+				line[strcspn(line, "\r\n")] = 0;
+				char *bar = strchr(line, '|');
+				if (line[0] == '#' || !bar || bar == line) continue;
+				*bar = 0;
+				if (kind == 0 && npmenu < MAX_PMENU) {
+					snprintf(pmenu[npmenu].label, sizeof pmenu[0].label, "%s", line);
+					snprintf(pmenu[npmenu].cmd, sizeof pmenu[0].cmd, "%s", bar + 1);
+					npmenu++;
+				} else if (kind == 1 && nmacro < MAX_MACRO) {
+					snprintf(macro[nmacro].label, sizeof macro[0].label, "%s", line);
+					unescape_keys(bar + 1, macro[nmacro].seq, sizeof macro[0].seq);
+					nmacro++;
+				}
+			}
+			fclose(f);
+		}
+		free(names[i]);
+	}
+	LOG("plugins: %d found, %d menu entries, %d keyboard keys", nplugs, npmenu, nmacro);
+}
+
+// Switch plugin i on or off (rewrites the enabled file); menu entries and keyboard keys follow at once, shell parts on restart.
+static void plugin_toggle(int i) {
+	char path[300], tmp[310];
+	if (i < 0 || i >= nplugs) return;
+	plugs[i].enabled = !plugs[i].enabled;
+	snprintf(path, sizeof path, "%s/enabled", plugins_dir);
+	snprintf(tmp, sizeof tmp, "%s.tmp", path);
+	FILE *f = fopen(tmp, "w");
+	if (!f) { LOG("plugin toggle failed: %s", strerror(errno)); plugs[i].enabled = !plugs[i].enabled; return; }
+	for (int k = 0; k < nplugs; k++)
+		if (plugs[k].enabled) fprintf(f, "%.*s\n", (int)(strlen(plugs[k].dir) - 7), plugs[k].dir);
+	fflush(f); fsync(fileno(f)); fclose(f);
+	rename(tmp, path);
+	plugins_load();
+	plug_dirty = true;
+}
+
+// ---- on-screen keyboard ---------------------------------------------------------------------
+// Two rows of terminal keys (Esc Tab ~ - Home Up End PgUp / Ctrl Alt / | Left Down Right PgDn), optional rows of plugin
+// keys, then a US layout: number row (Fn turns it into F1-F12), QWERTY, home, shift and bottom rows. Ctrl, Alt and
+// Shift are sticky: one tap = the next key only, a second tap = locked, a third = off. The terminal is resized to the
+// space above the keyboard whenever it is shown or hidden.
+enum { K_KEY, K_SHIFT, K_CTRL, K_ALT, K_FN, K_MACRO, K_MENU };
+typedef struct { const char *lo, *up; int code; int w; int kind; int fshift; int x, y, kw, kh; const char *seq; } OskKey;
+#define A_UP "\x01"
+#define A_DN "\x02"
+#define A_LT "\x03"
+#define A_RT "\x04"
+static const OskKey R_BAR1[] = {{"Esc", "Esc", KEY_ESC, 10}, {"Tab", "Tab", KEY_TAB, 10}, {"~", "~", KEY_GRAVE, 10, K_KEY, 1}, {"-", "-", KEY_MINUS, 10},
+	{"Home", "Home", KEY_HOME, 10}, {A_UP, A_UP, KEY_UP, 10}, {"End", "End", KEY_END, 10}, {"PgUp", "PgUp", KEY_PAGEUP, 10}};
+static const OskKey R_BAR2[] = {{"Ctrl", "Ctrl", 0, 10, K_CTRL}, {"Alt", "Alt", 0, 10, K_ALT}, {"/", "/", KEY_SLASH, 10}, {"|", "|", KEY_BACKSLASH, 10, K_KEY, 1},
+	{A_LT, A_LT, KEY_LEFT, 10}, {A_DN, A_DN, KEY_DOWN, 10}, {A_RT, A_RT, KEY_RIGHT, 10}, {"PgDn", "PgDn", KEY_PAGEDOWN, 10}};
+static const OskKey R_NUM[] = {{"`", "~", KEY_GRAVE, 10}, {"1", "!", KEY_1, 10}, {"2", "@", KEY_2, 10}, {"3", "#", KEY_3, 10}, {"4", "$", KEY_4, 10},
+	{"5", "%", KEY_5, 10}, {"6", "^", KEY_6, 10}, {"7", "&", KEY_7, 10}, {"8", "*", KEY_8, 10}, {"9", "(", KEY_9, 10}, {"0", ")", KEY_0, 10},
+	{"-", "_", KEY_MINUS, 10}, {"=", "+", KEY_EQUAL, 10}, {"Bksp", "Bksp", KEY_BACKSPACE, 16}};
+static const OskKey R_FN[] = {{"F1", "F1", KEY_F1, 10}, {"F2", "F2", KEY_F2, 10}, {"F3", "F3", KEY_F3, 10}, {"F4", "F4", KEY_F4, 10}, {"F5", "F5", KEY_F5, 10},
+	{"F6", "F6", KEY_F6, 10}, {"F7", "F7", KEY_F7, 10}, {"F8", "F8", KEY_F8, 10}, {"F9", "F9", KEY_F9, 10}, {"F10", "F10", KEY_F10, 10},
+	{"F11", "F11", KEY_F11, 10}, {"F12", "F12", KEY_F12, 10}, {"Bksp", "Bksp", KEY_BACKSPACE, 16}};
+static const OskKey R_QWE[] = {{"q", "Q", KEY_Q, 10}, {"w", "W", KEY_W, 10}, {"e", "E", KEY_E, 10}, {"r", "R", KEY_R, 10}, {"t", "T", KEY_T, 10},
+	{"y", "Y", KEY_Y, 10}, {"u", "U", KEY_U, 10}, {"i", "I", KEY_I, 10}, {"o", "O", KEY_O, 10}, {"p", "P", KEY_P, 10},
+	{"[", "{", KEY_LEFTBRACE, 10}, {"]", "}", KEY_RIGHTBRACE, 10}, {"\\", "|", KEY_BACKSLASH, 10}};
+static const OskKey R_ASD[] = {{"a", "A", KEY_A, 10}, {"s", "S", KEY_S, 10}, {"d", "D", KEY_D, 10}, {"f", "F", KEY_F, 10}, {"g", "G", KEY_G, 10},
+	{"h", "H", KEY_H, 10}, {"j", "J", KEY_J, 10}, {"k", "K", KEY_K, 10}, {"l", "L", KEY_L, 10}, {";", ":", KEY_SEMICOLON, 10},
+	{"'", "\"", KEY_APOSTROPHE, 10}, {"Enter", "Enter", KEY_ENTER, 18}};
+static const OskKey R_ZXC[] = {{"Shift", "Shift", 0, 18, K_SHIFT}, {"z", "Z", KEY_Z, 10}, {"x", "X", KEY_X, 10}, {"c", "C", KEY_C, 10}, {"v", "V", KEY_V, 10},
+	{"b", "B", KEY_B, 10}, {"n", "N", KEY_N, 10}, {"m", "M", KEY_M, 10}, {",", "<", KEY_COMMA, 10}, {".", ">", KEY_DOT, 10}, {"/", "?", KEY_SLASH, 10},
+	{"Shift", "Shift", 0, 18, K_SHIFT}};
+static const OskKey R_BOT[] = {{"Fn", "Fn", 0, 12, K_FN}, {"Menu", "Menu", 0, 12, K_MENU}, {"Space", "Space", KEY_SPACE, 52}, {"Del", "Del", KEY_DELETE, 12}, {"Ins", "Ins", KEY_INSERT, 12}};
+
+#define OSK_MAXKEYS 128
+static OskKey osk_keys[OSK_MAXKEYS];
+static int osk_n;
+static int osk_mod[3];               // shift, ctrl, alt: 0 off, 1 next key only, 2 locked
+static bool osk_fn;
+static OskKey *osk_down_key, *osk_rep, *osk_lit;
+static double osk_lit_until, osk_lit_from;
+static double osk_next_rep;
+
+static int osk_add_row(const OskKey *row, int n, int y, int kh) {
+	int tot = 0;
+	for (int i = 0; i < n; i++) tot += row[i].w;
+	int x = 0, acc = 0;
+	for (int i = 0; i < n && osk_n < OSK_MAXKEYS; i++) {
+		OskKey *k = &osk_keys[osk_n++];
+		*k = row[i];
+		acc += row[i].w;
+		int x1 = (lw - 2) * acc / tot;      // the last frame's right border takes the final 2 px
+		k->x = x; k->kw = x1 - x; k->y = y; k->kh = kh;
+		x = x1;
+	}
+	return y + kh;
+}
+
+// Fill osk_keys with rects for the current logical screen; returns the keyboard height in pixels.
+static int osk_layout(void) {
+	int kh = (lw < lh ? lw : lh) / 17;
+	if (kh < 40) kh = 40;
+	int nmrows = (nmacro + 7) / 8;
+	int nrows = 2 + nmrows + 5;
+	int h = nrows * kh + 2;           // the keys' own frames are the keyboard's border (2 px shared)
+	int y = lh - h;
+	osk_n = 0;
+	y = osk_add_row(R_BAR1, NOPTS(R_BAR1), y, kh);
+	y = osk_add_row(R_BAR2, NOPTS(R_BAR2), y, kh);
+	for (int m = 0; m < nmrows; m++) {
+		OskKey row[8];
+		int c = 0;
+		for (int i = m * 8; i < nmacro && c < 8; i++)
+			row[c++] = (OskKey){macro[i].label, macro[i].label, 0, 10, K_MACRO, 0, 0, 0, 0, 0, macro[i].seq};
+		y = osk_add_row(row, c, y, kh);
+	}
+	y = osk_add_row(osk_fn ? R_FN : R_NUM, osk_fn ? NOPTS(R_FN) : NOPTS(R_NUM), y, kh);
+	y = osk_add_row(R_QWE, NOPTS(R_QWE), y, kh);
+	y = osk_add_row(R_ASD, NOPTS(R_ASD), y, kh);
+	y = osk_add_row(R_ZXC, NOPTS(R_ZXC), y, kh);
+	osk_add_row(R_BOT, NOPTS(R_BOT), y, kh);
+	return h;
+}
+
+static void osk_fill(int x, int y, int w, int h, GhosttyColorRgb c) {
+	uint32_t p = pack_rgb(c.r, c.g, c.b);
+	for (int yy = y < 0 ? 0 : y; yy < y + h && yy < lh; yy++)
+		for (int xx = x < 0 ? 0 : x; xx < x + w && xx < lw; xx++) *pix(xx, yy) = p;
+}
+
+static uint32_t utf8_next(const char **sp) {
+	const unsigned char *s = (const unsigned char *)*sp;
+	uint32_t c = *s++;
+	int extra = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc0 ? 1 : 0;
+	if (extra) c &= 0x3f >> extra;
+	while (extra-- > 0 && (*s & 0xc0) == 0x80) c = (c << 6) | (*s++ & 0x3f);
+	*sp = (const char *)s;
+	return c;
+}
+
+static stbtt_fontinfo *font_for(uint32_t cp) {
+	if (stbtt_FindGlyphIndex(&ttf_fi[0], cp)) return &ttf_fi[0];
+	if (have_sym_font && stbtt_FindGlyphIndex(&ttf_fi[2], cp)) return &ttf_fi[2];
+	return &ttf_fi[0];
+}
+
+// Draw `s` centred in the rect, shrinking it to fit.
+static void osk_text(int x, int y, int w, int h, const char *s, GhosttyColorRgb fg, GhosttyColorRgb bg, float px) {
+	float width;
+	for (;; px -= 2) {
+		width = 0;
+		const char *t = s;
+		while (*t) {
+			uint32_t cp = utf8_next(&t);
+			stbtt_fontinfo *fi = font_for(cp);
+			int adv, lsb;
+			stbtt_GetCodepointHMetrics(fi, cp, &adv, &lsb);
+			width += adv * stbtt_ScaleForPixelHeight(fi, px);
+		}
+		if (width <= w - 6 || px <= 14) break;
+	}
+	int asc, desc, gap;
+	stbtt_GetFontVMetrics(&ttf_fi[0], &asc, &desc, &gap);
+	float sc0 = stbtt_ScaleForPixelHeight(&ttf_fi[0], px);
+	int base = y + (int)((h - (asc - desc) * sc0) / 2 + asc * sc0 + 0.5f);
+	float cx = x + (w - width) / 2;
+	while (*s) {
+		uint32_t cp = utf8_next(&s);
+		stbtt_fontinfo *fi = font_for(cp);
+		float sc = stbtt_ScaleForPixelHeight(fi, px);
+		int adv, lsb, x0, y0, x1, y1;
+		stbtt_GetCodepointHMetrics(fi, cp, &adv, &lsb);
+		stbtt_GetCodepointBitmapBox(fi, cp, sc, sc, &x0, &y0, &x1, &y1);
+		int gw = x1 - x0, gh = y1 - y0;
+		if (gw > 0 && gh > 0 && gw < 200 && gh < 200) {
+			uint8_t *bm = calloc(gw, gh);
+			stbtt_MakeCodepointBitmap(fi, bm, gw, gh, gw, sc, sc, cp);
+			for (int yy = 0; yy < gh; yy++)
+				for (int xx = 0; xx < gw; xx++) {
+					int a = gamma_lut[bm[yy * gw + xx]];
+					if (!a) continue;
+					int px_ = (int)cx + x0 + xx, py_ = base + y0 + yy;
+					if (px_ < 0 || py_ < 0 || px_ >= lw || py_ >= lh) continue;
+					*pix(px_, py_) = pack_rgb(bg.r + (fg.r - bg.r) * a / 255, bg.g + (fg.g - bg.g) * a / 255, bg.b + (fg.b - bg.b) * a / 255);
+				}
+			free(bm);
+		}
+		cx += adv * sc;
+	}
+}
+
+// Filled triangle pointing up (1), down (2), left (3) or right (4), centred at cx,cy, `s` px across.
+static void osk_arrow(int cx, int cy, int s, int dir, GhosttyColorRgb c) {
+	uint32_t p = pack_rgb(c.r, c.g, c.b);
+	for (int dy = -s; dy <= s; dy++)
+		for (int dx = -s; dx <= s; dx++) {
+			int u, v;
+			switch (dir) {
+			case 1: u = dx; v = dy; break;
+			case 2: u = dx; v = -dy; break;
+			case 3: u = dy; v = dx; break;
+			default: u = dy; v = -dx;
+			}
+			if (v < -s / 2 || v > s / 2) continue;
+			int half = (v + s / 2) / 2;
+			if (abs(u) <= half) *pix(cx + dx, cy + dy) = p;
+		}
+}
+
+static bool osk_key_active(const OskKey *k) {
+	if (k->kind == K_SHIFT) return osk_mod[0] != 0;
+	if (k->kind == K_CTRL) return osk_mod[1] != 0;
+	if (k->kind == K_ALT) return osk_mod[2] != 0;
+	if (k->kind == K_FN) return osk_fn;
+	return false;
+}
+
+static void osk_draw_key(const OskKey *k, bool pressed) {
+	GhosttyColorRgb F = deffg, B = defbg;
+	bool inv = pressed || osk_key_active(k);
+	int locked_mod = (k->kind == K_SHIFT && osk_mod[0] == 2) || (k->kind == K_CTRL && osk_mod[1] == 2) || (k->kind == K_ALT && osk_mod[2] == 2);
+	// Neighbouring keys share one 2 px border: each frame reaches 2 px into the next cell.
+	int x = k->x, y = k->y, w = k->kw + 2, h = k->kh + 2;
+	osk_fill(x, y, w, h, F);
+	osk_fill(x + 2, y + 2, w - 4, h - 4, inv ? F : B);
+	if (locked_mod) {            // locked modifier: a light inner frame inside the dark key
+		osk_fill(x + 5, y + 5, w - 10, h - 10, B);
+		osk_fill(x + 8, y + 8, w - 16, h - 16, F);
+	}
+	GhosttyColorRgb fg = inv ? B : F, bg = inv ? F : B;
+	const char *label = (osk_mod[0] && k->kind == K_KEY && !k->fshift) ? k->up : k->lo;
+	if ((unsigned char)label[0] >= 1 && (unsigned char)label[0] <= 4) osk_arrow(x + w / 2, y + h / 2, h / 3, label[0], fg);
+	else osk_text(x, y, w, h, label, fg, bg, k->kh * 0.42f);
+}
+
+static void osk_draw_all(void) {
+	if (!osk_visible) return;
+	osk_layout();
+	glyph_binary = false;
+	osk_fill(0, osk_y0, lw, osk_h, defbg);
+	for (int i = 0; i < osk_n; i++) osk_draw_key(&osk_keys[i], false);
+}
+
+static void refresh_rect(WFM_MODE_INDEX_T wfm, int lx, int ly, int w, int h, bool flash) {
+	FBInkConfig c = cfg;
+	c.wfm_mode = wfm;
+	c.is_flashing = flash;
+	int px, py, pw, ph;
+	phys_rect(lx, ly, w, h, &px, &py, &pw, &ph);
+	if (pw > 0 && ph > 0 && fbink_refresh(fb, py, px, pw, ph, &c) < 0) LOG("refresh_rect failed");
+}
+
+static void osk_key_refresh(const OskKey *k) { refresh_rect(WFM_DU, k->x, k->y, k->kw + 2, k->kh + 2, false); }
+
+// After typing settles the keyboard is redrawn with the quality waveform (its labels were drawn with the fast one).
+static void osk_quality(void) {
+	if (osk_visible && osk_act) { osk_act = false; refresh_rect(WFM_GC16, 0, osk_y0, lw, osk_h, false); }
+}
+
+static void osk_redraw_fast(void) { osk_draw_all(); refresh_rect(WFM_DU, 0, osk_y0, lw, osk_h, false); }
+
+static void osk_reset_mods(void) {
+	bool changed = false;
+	for (int i = 0; i < 3; i++) if (osk_mod[i] == 1) { osk_mod[i] = 0; changed = true; }
+	if (changed) osk_redraw_fast();
+}
+
+static bool session_dead;
+static void reconnect_session(void);
+static void scroll_to_bottom(void) {
+	GhosttyTerminalScrollViewport sv = {0};
+	sv.tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM;
+	ghostty_terminal_scroll_viewport(term, sv);
+}
+
+static void osk_send(const OskKey *k) {
+	int s = mod_shift, c = mod_ctrl, a = mod_alt;
+	if (osk_mod[0] || k->fshift) mod_shift = 1;
+	if (osk_mod[1]) mod_ctrl = 1;
+	if (osk_mod[2]) mod_alt = 1;
+	char out[32];
+	int len = encode_key(k->code, out);
+	mod_shift = s; mod_ctrl = c; mod_alt = a;
+	if (len > 0) { scroll_to_bottom(); pty_write(out, len); }
+}
+
+static void osk_sync(bool force);
+static void osk_unlight(void);
+static void menu_show(void);
+static void menu_key(int code, int shift);
+// Finger down on a key. Returns true when the terminal needs a redraw.
+static bool osk_press(OskKey *k) {
+	osk_act = osk_new = true;
+	osk_unlight();
+	switch (k->kind) {
+	case K_SHIFT: case K_CTRL: case K_ALT: {
+		int *m = &osk_mod[k->kind - K_SHIFT];
+		*m = (*m + 1) % 3;
+		osk_redraw_fast();
+		return false;
+	}
+	case K_FN: osk_fn = !osk_fn; osk_redraw_fast(); return false;
+	case K_MENU: menu_show(); return false;       // the only way into the menu on devices without buttons (Kindle)
+	case K_MACRO: if (!session_dead && !menu_open) { scroll_to_bottom(); pty_write(k->seq, strlen(k->seq)); } break;
+	default:
+		if (menu_open) { menu_key(k->code, osk_mod[0]); break; }
+		if (session_dead) { if (k->code == KEY_ENTER) { reconnect_session(); return true; } return false; }
+		osk_send(k);
+		osk_rep = k; osk_next_rep = now() + 0.5;
+	}
+	osk_draw_key(k, true);
+	osk_key_refresh(k);
+	osk_down_key = k;
+	osk_lit_from = now();
+	return false;
+}
+
+// A tapped key stays inverted for at least 150 ms so the flash is visible; osk_unlight() ends it.
+static void osk_unlight(void) {
+	if (!osk_lit) return;
+	osk_draw_key(osk_lit, false);
+	osk_key_refresh(osk_lit);
+	osk_lit = NULL;
+	osk_reset_mods();
+}
+
+static void osk_release(void) {
+	osk_rep = NULL;
+	if (osk_down_key) {
+		osk_lit = osk_down_key;
+		osk_down_key = NULL;
+		if (now() >= osk_lit_from + 0.15) osk_unlight();
+		else osk_lit_until = osk_lit_from + 0.15;
+	}
+}
+
+static OskKey *osk_hit(int lx, int ly) {
+	if (!osk_visible || ly < osk_y0) return NULL;
+	for (int i = 0; i < osk_n; i++)
+		if (lx >= osk_keys[i].x && lx < osk_keys[i].x + osk_keys[i].kw && ly >= osk_keys[i].y && ly < osk_keys[i].y + osk_keys[i].kh) return &osk_keys[i];
+	return NULL;
+}
+
+static bool osk_want(void) {
+	if (osk_mode == 1) return true;
+	if (osk_mode == 2) return false;
+	for (int i = 0; i < nk; i++) if (kfd[i] >= 0) return false;     // a Bluetooth keyboard is connected
+	return true;
+}
+
+// Show or hide the keyboard according to the setting; resizes the terminal when that changes it.
+static void osk_sync(bool force) {
+	bool want = osk_want();
+	if (want == osk_visible && !force) return;
+	osk_visible = want;
+	apply_geometry();
+}
+
 // ---- menu (pages: main, orientation, text size, frontlight, touch) ----
-enum { PG_MAIN, PG_ORIENT, PG_TEXT, PG_THEME, PG_COLORS, PG_LIGHT, PG_TOUCH };
-enum { A_RESUME = 1, A_ORIENT, A_TEXT, A_THEME, A_COLORS, A_LIGHT, A_TOUCH, A_REFRESH, A_LOCK, A_REBOOT, A_POWEROFF, A_BACK,
-       A_ROT = 100, A_SIZE = 200, A_THEMEPICK = 250, A_COLORPICK = 260, A_BRIGHTER = 300, A_DIMMER, A_WARMER, A_COOLER, A_TOUCHMODE = 400, A_SCROLLDIR = 410 };
+enum { PG_MAIN, PG_ORIENT, PG_TEXT, PG_THEME, PG_COLORS, PG_LIGHT, PG_TOUCH, PG_REFRESH, PG_KEYBOARD, PG_PLUGINS, PG_PLUGRUN };
+enum { A_RESUME = 1, A_ORIENT, A_TEXT, A_THEME, A_COLORS, A_LIGHT, A_TOUCH, A_REFRESH, A_LOCK, A_REBOOT, A_POWEROFF, A_BACK, A_RFMENU, A_KBMENU, A_PLUGMENU,
+       A_RFBATCH, A_RFQUAL, A_RFFLASH, A_RFRESET, A_ROTAUTO, A_GESTUP, A_GESTDOWN, A_PLUGRUN,
+       A_ROT = 100, A_SIZE = 200, A_THEMEPICK = 250, A_COLORPICK = 260, A_BRIGHTER = 300, A_DIMMER, A_WARMER, A_COOLER, A_TOUCHMODE = 400, A_SCROLLDIR = 410, A_RFWFM = 420, A_OSKMODE = 430, A_PLUGIN = 500, A_PLUGTOG = 520 };
 typedef struct { char label[72]; int id; } MItem;
-#define MENU_ITEMS 11          /* the main page is the longest; the box keeps this height on every page */
-static MItem mitems[MENU_ITEMS + 2];
+#define MENU_ITEMS 14          /* the main page is the longest; the box keeps this height on every page */
+static MItem mitems[MENU_ITEMS + 2];   /* plugin entries are capped (MAX_PMENU) so that the longest page fits */
 static int mcount, menu_page, menu_sel;
 static int menu_c0, menu_r0, menu_w, menu_h;
 static const int text_px[] = {22, 26, 30, 34, 40, 46, 54};
@@ -851,13 +1433,21 @@ static void menu_build(void) {
 		madd(A_COLORS, "Colors  >");
 		madd(A_LIGHT, "Frontlight  >");
 		madd(A_TOUCH, "Touch  >");
+		madd(A_RFMENU, "Screen refresh  >");
+		madd(A_KBMENU, "On-screen keyboard  >");
+		madd(A_PLUGMENU, "Plugins  >");
 		madd(A_REFRESH, "Clear ghosting");
 		madd(A_LOCK, "Lock screen");
+#ifdef GHOSTTY_INK_KINDLE
+		madd(A_REBOOT, "Exit to Kindle");
+#else
 		madd(A_REBOOT, "Exit to Kobo (reboots)");
+#endif
 		madd(A_POWEROFF, "Power off");
 		break;
 	case PG_ORIENT:
-		for (int i = 0; i < 4; i++) madd(A_ROT + i, "%s%s", orient[i], rotation == i * 90 ? "   [now]" : "");
+		if (acc_dir[0]) madd(A_ROTAUTO, "Auto (follow the sensor)%s", rot_auto ? "   [now]" : "");
+		for (int i = 0; i < 4; i++) madd(A_ROT + i, "%s%s", orient[i], !rot_auto && rotation == i * 90 ? "   [now]" : "");
 		madd(A_BACK, "Back");
 		break;
 	case PG_TEXT:
@@ -878,8 +1468,38 @@ static void menu_build(void) {
 	case PG_LIGHT:
 		madd(A_BRIGHTER, "Brighter      (now %d%%)", fl_bright());
 		madd(A_DIMMER, "Dimmer");
-		madd(A_WARMER, "Warmer        (now %d%%)", fl_warm_pct());
-		madd(A_COOLER, "Cooler");
+		if (fl_warm_pct() >= 0) {
+			madd(A_WARMER, "Warmer        (now %d%%)", fl_warm_pct());
+			madd(A_COOLER, "Cooler");
+		}
+		madd(A_BACK, "Back");
+		break;
+	case PG_REFRESH: {
+		static const char *wn[] = {"Fast (DU): crisp 1-bit text", "Fastest (A2): ghosts more", "Smooth (GL16): anti-aliased, slower"};
+		for (int i = 0; i < 3; i++) madd(A_RFWFM + i, "%s%s", wn[i], rf_wfm == i ? "   [now]" : "");
+		madd(A_RFBATCH, "Batch changes for %d ms  (tap: next)", rf_batch_ms);
+		if (rf_quality_ms) madd(A_RFQUAL, "Clean-up after idle: %.1f s  (tap: next)", rf_quality_ms / 1000.0);
+		else madd(A_RFQUAL, "Clean-up after idle: off  (tap: next)");
+		if (rf_flash_rows) madd(A_RFFLASH, "Flash clean-up: ~%d rows  (tap: next)", rf_flash_rows);
+		else madd(A_RFFLASH, "Flash clean-up: off  (tap: next)");
+		madd(A_RFRESET, "Reset to defaults");
+		madd(A_BACK, "Back");
+		break;
+	}
+	case PG_KEYBOARD: {
+		static const char *kn[] = {"Auto: show while no Bluetooth keyboard", "Always show", "Always hide"};
+		for (int i = 0; i < 3; i++) madd(A_OSKMODE + i, "%s%s", kn[i], osk_mode == i ? "   [now]" : "");
+		madd(A_BACK, "Back");
+		break;
+	}
+	case PG_PLUGINS:
+		for (int i = 0; i < nplugs; i++) madd(A_PLUGTOG + i, "%-24s [%s]", plugs[i].name, plugs[i].enabled ? "on" : "off");
+		if (!nplugs) madd(A_BACK, "No plugins in the plugins folder");
+		if (npmenu) madd(A_PLUGRUN, "Plugin commands  >");
+		madd(A_BACK, "Back");
+		break;
+	case PG_PLUGRUN:
+		for (int i = 0; i < npmenu; i++) madd(A_PLUGIN + i, "%s", pmenu[i].label);
 		madd(A_BACK, "Back");
 		break;
 	case PG_TOUCH:
@@ -887,6 +1507,8 @@ static void menu_build(void) {
 		madd(A_TOUCHMODE + 1, "Scroll only%s", touch_mode == 1 ? "   [now]" : "");
 		madd(A_TOUCHMODE + 2, "Scroll + mouse clicks%s", touch_mode == 2 ? "   [now]" : "");
 		madd(A_SCROLLDIR, "Swipe: %s", scroll_natural ? "content follows finger" : "reversed");
+		madd(A_GESTUP, "2-finger swipe up: %s", gesture_names[gest_up]);
+		madd(A_GESTDOWN, "2-finger swipe down: %s", gesture_names[gest_down]);
 		madd(A_BACK, "Back");
 		break;
 	}
@@ -919,9 +1541,9 @@ static void status_text(char *out, size_t n) {
 }
 
 static void menu_draw(void) {
-	static const char *titles[] = {"kgterm menu", "Orientation", "Text size", "Theme", "Colors", "Frontlight", "Touch"};
+	static const char *titles[] = {"Ghostty Ink menu", "Orientation", "Text size", "Theme", "Colors", "Frontlight", "Touch", "Screen refresh", "On-screen keyboard", "Plugins (tap: on/off)", "Plugin commands"};
 	GhosttyColorRgb W = {255, 255, 255}, K = {0, 0, 0};
-	menu_w = 48 < cols - 2 ? 48 : cols - 2;
+	menu_w = 56 < cols - 2 ? 56 : cols - 2;
 	menu_h = MENU_ITEMS + 5;
 	menu_c0 = (cols - menu_w) / 2;
 	menu_r0 = (rows - menu_h) / 2;
@@ -970,14 +1592,50 @@ static void menu_prev(void) { menu_sel = (menu_sel + mcount - 1) % mcount; menu_
 static void menu_back(void) { if (menu_page == PG_MAIN) menu_close(); else menu_goto(PG_MAIN); }
 
 static void lock_screen(void);
+static void acc_enable(bool on);
 static void menu_activate(void) {
 	int id = mitems[menu_sel].id;
-	if (id >= A_ROT && id < A_ROT + 4) { rotation = (id - A_ROT) * 90; settings_save(); menu_open = false; apply_geometry(); return; }
+	if (id >= A_ROT && id < A_ROT + 4) { rotation = rot_manual = (id - A_ROT) * 90; if (rot_auto) acc_enable(false); rot_auto = 0; rot_pending = -1; settings_save(); menu_open = false; apply_geometry(); return; }
 	if (id >= A_SIZE && id < A_SIZE + NSIZES) { ttf_px = text_px[id - A_SIZE]; settings_save(); menu_open = false; apply_geometry(); return; }
 	if (id >= A_THEMEPICK && id < A_THEMEPICK + NTHEMES) { theme_idx = id - A_THEMEPICK; settings_save(); menu_open = false; apply_theme(); redraw_all(true); return; }
 	if (id >= A_COLORPICK && id < A_COLORPICK + 4) { color_mode = id - A_COLORPICK; settings_save(); menu_open = false; redraw_all(true); return; }
 	if (id >= A_TOUCHMODE && id < A_TOUCHMODE + 3) { touch_mode = id - A_TOUCHMODE; settings_save(); menu_build(); menu_draw(); return; }
+	if (id >= A_RFWFM && id < A_RFWFM + 3) { rf_wfm = id - A_RFWFM; settings_save(); menu_build(); menu_draw(); return; }
+	if (id >= A_OSKMODE && id < A_OSKMODE + 3) {
+		osk_mode = id - A_OSKMODE; settings_save(); menu_open = false;
+		if (osk_want() != osk_visible) osk_sync(false); else redraw_all(false);
+		return;
+	}
+	if (id >= A_PLUGTOG && id < A_PLUGTOG + nplugs) {
+		int keep = menu_sel;
+		plugin_toggle(id - A_PLUGTOG);
+		menu_build(); menu_sel = keep < mcount ? keep : mcount - 1; menu_draw();
+		return;
+	}
+	if (id >= A_PLUGIN && id < A_PLUGIN + npmenu) {
+		menu_open = false;
+		redraw_all(false);
+		if (!session_dead) { char cmd[210]; int n = snprintf(cmd, sizeof cmd, "%s\r", pmenu[id - A_PLUGIN].cmd); scroll_to_bottom(); pty_write(cmd, n); }
+		return;
+	}
 	switch (id) {
+	case A_ROTAUTO: rot_auto = 1; acc_enable(true); rot_pending = -1; if (rot_auto_last >= 0) rotation = rot_auto_last; settings_save(); menu_open = false; apply_geometry(); break;
+	case A_RFMENU: menu_goto(PG_REFRESH); break;
+	case A_KBMENU: menu_goto(PG_KEYBOARD); break;
+	case A_PLUGMENU: menu_goto(PG_PLUGINS); break;
+	case A_PLUGRUN: menu_goto(PG_PLUGRUN); break;
+	case A_GESTUP: gest_up = (gest_up + 1) % GA_COUNT; settings_save(); menu_build(); menu_draw(); break;
+	case A_GESTDOWN: gest_down = (gest_down + 1) % GA_COUNT; settings_save(); menu_build(); menu_draw(); break;
+	case A_RFBATCH: case A_RFQUAL: case A_RFFLASH: {
+		int *v = id == A_RFBATCH ? &rf_batch_ms : id == A_RFQUAL ? &rf_quality_ms : &rf_flash_rows;
+		const int *o = id == A_RFBATCH ? rf_batch_opts : id == A_RFQUAL ? rf_quality_opts : rf_flash_opts;
+		int n = id == A_RFBATCH ? NOPTS(rf_batch_opts) : id == A_RFQUAL ? NOPTS(rf_quality_opts) : NOPTS(rf_flash_opts), i;
+		for (i = 0; i < n; i++) if (o[i] == *v) break;
+		*v = o[(i + 1) % n];
+		settings_save(); menu_build(); menu_draw();
+		break;
+	}
+	case A_RFRESET: rf_wfm = 0; rf_batch_ms = 60; rf_quality_ms = 600; rf_flash_rows = 160; settings_save(); menu_build(); menu_draw(); break;
 	case A_RESUME: menu_close(); break;
 	case A_ORIENT: menu_goto(PG_ORIENT); break;
 	case A_TEXT: menu_goto(PG_TEXT); break;
@@ -1008,6 +1666,16 @@ static void menu_activate(void) {
 	}
 }
 
+// A key pressed while the menu is open (Bluetooth keyboard or the on-screen one) navigates it.
+static void menu_key(int code, int shift) {
+	LOG("menu key %d (page %d, item %d/%d)", code, menu_page, menu_sel, mcount);
+	if (code == KEY_UP || code == KEY_K || (code == KEY_TAB && shift)) menu_prev();
+	else if (code == KEY_DOWN || code == KEY_J || code == KEY_TAB) menu_next();
+	else if (code == KEY_ENTER || code == KEY_KPENTER || code == KEY_RIGHT || code == KEY_SPACE) menu_activate();
+	else if (code == KEY_ESC || code == KEY_Q || code == KEY_LEFT || code == KEY_BACKSPACE) menu_back();
+	else if (code >= KEY_1 && code <= KEY_9 && code - KEY_1 < mcount) { menu_sel = code - KEY_1; menu_activate(); }
+}
+
 // ---- lock screen (power button): blank, frontlight off, all input ignored until the power button is pressed again ----
 static int saved_bright = -1;
 static void lock_screen(void) {
@@ -1036,6 +1704,10 @@ static void unlock_screen(void) {
 static int t_slot, t_track = -1, t_rx, t_ry, t_down, t_moved, t_sx, t_sy, t_lx, t_ly, t_lasty;
 static double t_t0;
 static int t_logged;
+static int s1_track = -1, s1_rx, s1_ry;    // second finger (slot 1)
+static bool g_active, g_fired, t_gesture;   // two fingers down / gesture already triggered / this touch became a gesture
+static int g0x, g0y, g1x, g1y;              // where the two fingers started
+static bool t_in_osk;                 // the current touch started on the on-screen keyboard
 
 static void phys_to_logical(int x, int y, int *lx, int *ly) {
 	switch (rotation) {
@@ -1088,13 +1760,124 @@ static bool scroll_step(bool up, int lx, int ly) {
 	return true;
 }
 
+static void gesture_do(int a) {
+	switch (a) {
+	case GA_SHOW_KB: osk_mode = 1; settings_save(); osk_sync(false); break;
+	case GA_HIDE_KB: osk_mode = 2; settings_save(); osk_sync(false); break;
+	case GA_CLEAR: redraw_all(true); break;
+	case GA_MENU: menu_show(); break;
+	}
+}
+
+// ---- edge sliders: one finger sliding up/down along the left edge changes the frontlight, along the right edge the
+// warmth (only where the device has it). A temporary overlay shows the value; it goes away shortly after the finger lifts.
+static int t_edge;                     // this touch started on an edge: 1 left (brightness), 2 right (warmth)
+static bool t_edge_moved;
+static int edge_y0, edge_v0, edge_v;   // where the slide started, the value then, the value now
+static bool ov_up;                     // overlay on screen
+static double ov_until, ov_drawn;
+
+static int edge_width(void) { int w = lw / 14; return w < 50 ? 50 : w; }
+
+static void overlay_draw(const char *what, int v) {
+	if (!osk_visible && !cell_h) return;
+	char buf[40];
+	snprintf(buf, sizeof buf, "%s %d%%", what, v);
+	int bw = lw / 2, bh = cell_h * 2, x = (lw - bw) / 2, y = lh / 3;
+	glyph_binary = false;
+	osk_fill(x, y, bw, bh, deffg);
+	osk_fill(x + 3, y + 3, bw - 6, bh - 6, defbg);
+	osk_text(x + 3, y + 3, bw - 6, bh - 6, buf, deffg, defbg, cell_h * 1.1f);
+	refresh_rect(WFM_DU, x, y, bw, bh, false);
+	ov_up = true;
+	ov_drawn = now();
+}
+
+static void edge_start(int lx, int ly) {
+	t_edge = 0;
+	if (menu_open || locked) return;
+	int ew = edge_width();
+	if (lx < ew && fl_bright() >= 0) t_edge = 1;
+	else if (lx >= lw - ew && fl_warm_pct() >= 0) t_edge = 2;
+	if (!t_edge) return;
+	t_edge_moved = false;
+	edge_y0 = ly;
+	LOG("edge slide %s starts (rotation %d, raw %d,%d -> logical %d,%d)", t_edge == 1 ? "left" : "right", rotation, t_rx, t_ry, lx, ly);
+	edge_v0 = edge_v = t_edge == 1 ? fl_bright() : fl_warm_pct();
+}
+
+static void edge_move(int ly) {
+	int span = lh / 2;
+	int v = edge_v0 + (edge_y0 - ly) * 100 / span;
+	v = v < 0 ? 0 : v > 100 ? 100 : v;
+	if (v == edge_v && t_edge_moved) return;
+	t_edge_moved = true;
+	edge_v = v;
+	if (t_edge == 1) fl_set_bright(v); else fl_set_warm(v);
+	if (now() - ov_drawn >= 0.12) overlay_draw(t_edge == 1 ? "Frontlight" : "Warmth", v);
+	ov_until = now() + 1.2;
+}
+
+static void edge_end(void) {
+	if (t_edge_moved) {
+		overlay_draw(t_edge == 1 ? "Frontlight" : "Warmth", edge_v);
+		if (t_edge == 1) set_bright = edge_v; else set_warm = edge_v;
+		settings_save();
+		ov_until = now() + 1.2;
+	}
+	t_edge = 0;
+}
+
+static void acc_enable(bool on) {
+	if (!acc_dir[0]) return;
+	char pth[140];
+	snprintf(pth, sizeof pth, "%s/enable", acc_dir);
+	FILE *f = fopen(pth, "w");
+	if (f) { fprintf(f, "%d\n", on ? 1 : 0); fclose(f); }
+}
+
+// Sample gravity ~4 times a second while auto is on. Portrait: gravity along -y; upside down: +y; device turned
+// clockwise (its top edge to the right): -x; counter-clockwise: +x. (Measured on a Libra Colour, 2026-10-13.) Face-up or
+// diagonal poses change nothing; a new orientation is applied once it has been stable for 0.7 s.
+static void acc_poll(double t) {
+	static double last;
+	if (!rot_auto || !acc_dir[0] || t - last < 0.25) return;
+	last = t;
+	char pth[140];
+	snprintf(pth, sizeof pth, "%s/xyz", acc_dir);
+	FILE *f = fopen(pth, "r");
+	if (!f) return;
+	int x, y, z;
+	int n = fscanf(f, "x:%d , y:%d , z:%d", &x, &y, &z);
+	fclose(f);
+	if (n != 3) return;
+	int r = -1, ax = abs(x), ay = abs(y);
+	if (ay > 6000 && ay * 10 > ax * 14) r = y < 0 ? 0 : 180;
+	else if (ax > 6000 && ax * 10 > ay * 14) r = x < 0 ? 270 : 90;
+	if (r < 0) return;
+	if (r == rotation) rot_pending = -1;
+	else if (r != rot_pending) { rot_pending = r; rot_pend_t = t; LOG("accelerometer x%d y%d z%d -> rotation %d", x, y, z, r); }
+}
+
 static bool touch_release(double t);
 // Feed one raw input event; returns true when the terminal view needs a redraw.
-static bool touch_event(const struct input_event *ev, double t) {
+static bool touch_event(const struct input_event *ev_in, double t) {
 	bool redraw = false;
 	if (locked) return false;
+	struct input_event mapped = *ev_in;
+	const struct input_event *ev = &mapped;
+	if (t_single) {          // present a single-touch panel as multi-touch slot 0
+		if (mapped.type == EV_KEY && mapped.code == BTN_TOUCH) { mapped.type = EV_ABS; mapped.code = ABS_MT_TRACKING_ID; mapped.value = mapped.value ? 1 : -1; }
+		else if (mapped.type == EV_ABS && mapped.code == ABS_X) mapped.code = ABS_MT_POSITION_X;
+		else if (mapped.type == EV_ABS && mapped.code == ABS_Y) mapped.code = ABS_MT_POSITION_Y;
+	}
 	if (ev->type == EV_ABS) {
 		if (ev->code == ABS_MT_SLOT) t_slot = ev->value;
+		else if (t_slot == 1) {
+			if (ev->code == ABS_MT_TRACKING_ID) s1_track = ev->value >= 0 ? ev->value : -1;
+			else if (ev->code == ABS_MT_POSITION_X) s1_rx = ev->value;
+			else if (ev->code == ABS_MT_POSITION_Y) s1_ry = ev->value;
+		}
 		else if (t_slot != 0) return false;
 		else if (ev->code == ABS_MT_TRACKING_ID) {
 			if (ev->value >= 0 && t_track < 0) { t_track = ev->value; t_down = 1; t_moved = 0; t_t0 = t; t_sx = -1; }
@@ -1105,17 +1888,42 @@ static bool touch_event(const struct input_event *ev, double t) {
 	} else if (ev->type == EV_SYN && ev->code == SYN_REPORT) {
 		int lx, ly;
 		touch_to_logical(t_rx, t_ry, &lx, &ly);
+		if (t_track >= 0 && s1_track >= 0) {
+			int l1x, l1y;
+			touch_to_logical(s1_rx, s1_ry, &l1x, &l1y);
+			if (!g_active) {
+				g_active = t_gesture = true; g_fired = false;
+				g0x = lx; g0y = ly; g1x = l1x; g1y = l1y;
+				if (t_in_osk) { osk_release(); t_in_osk = false; }
+				t_edge = 0;
+			} else if (!g_fired && !menu_open) {
+				int d0 = ly - g0y, d1 = l1y - g1y, dx = ((lx - g0x) + (l1x - g1x)) / 2, dy = (d0 + d1) / 2;
+				if (abs(d0) >= 100 && abs(d1) >= 100 && (d0 > 0) == (d1 > 0) && abs(dy) > abs(dx)) {
+					g_fired = true;
+					LOG("two-finger swipe %s (rotation %d, logical dy %d, raw %d,%d -> %d,%d)", dy < 0 ? "up" : "down", rotation, dy, t_rx, t_ry, lx, ly);
+					gesture_do(dy < 0 ? gest_up : gest_down);
+				}
+			}
+		} else g_active = false;
 		if (t_down == 1) {
 			t_sx = lx; t_sy = ly; t_lasty = ly; t_down = 0;
+			OskKey *ok = osk_hit(lx, ly);
+			t_in_osk = ok != NULL;
+			if (ok) redraw |= osk_press(ok); else edge_start(lx, ly);
 			if (t_logged < 30) { t_logged++; LOG("touch down raw %d,%d -> logical %d,%d (cell %d,%d)", t_rx, t_ry, lx, ly, (lx - grid_ox) / cell_w, (ly - grid_oy) / cell_h); }
 		} else if (t_down == 2) {
 			t_down = 0;
-			if (t_sx >= 0) redraw = touch_release(t);
+			bool slid = t_edge && t_edge_moved;
+			if (t_edge) edge_end();
+			if (t_in_osk) { osk_release(); t_in_osk = false; }
+			else if (slid) { /* the slide was the whole touch */ }
+			else if (t_sx >= 0 && !t_gesture) redraw = touch_release(t);
 			t_sx = -1;
 		} else if (t_track >= 0 && t_sx >= 0) {
 			t_lx = lx; t_ly = ly;
 			if (!t_moved && (abs(lx - t_sx) > 14 || abs(ly - t_sy) > 14)) t_moved = 1;
-			if (t_moved && !menu_open) {
+			if (t_edge && !t_gesture) { if (abs(ly - t_sy) > 14 || t_edge_moved) edge_move(ly); }
+			else if (t_moved && !menu_open && !t_in_osk && !t_gesture) {
 				int dy = ly - t_lasty;
 				while (abs(dy) >= cell_h) {
 					bool finger_down = dy > 0;
@@ -1126,6 +1934,7 @@ static bool touch_event(const struct input_event *ev, double t) {
 			}
 		}
 		t_lx = lx; t_ly = ly;
+		if (t_track < 0 && s1_track < 0) t_gesture = false;
 	}
 	return redraw;
 }
@@ -1196,7 +2005,6 @@ static int spawn(char **argv) {
 }
 
 static char **g_cmd;
-static bool session_dead;
 static double session_t0;
 
 // The program in the pty ended (ssh dropped, shell exited...): keep the screen and say why, instead of leaving at once.
@@ -1225,9 +2033,14 @@ static void reconnect_session(void) {
 
 #include <ucontext.h>
 static void on_segv(int sig, siginfo_t *si, void *uc_) {
+#ifdef __arm__
 	ucontext_t *uc = uc_;
 	LOG("SIGNAL %d addr=%p pc=%lx lr=%lx sp=%lx", sig, si->si_addr, (unsigned long)uc->uc_mcontext.arm_pc,
 	    (unsigned long)uc->uc_mcontext.arm_lr, (unsigned long)uc->uc_mcontext.arm_sp);
+#else
+	(void)uc_;
+	LOG("SIGNAL %d addr=%p", sig, si->si_addr);
+#endif
 	_exit(139);
 }
 static volatile sig_atomic_t quit;
@@ -1250,14 +2063,17 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "-b") && i + 1 < argc) font_bold_path = argv[++i];
 		else if (!strcmp(argv[i], "-S") && i + 1 < argc) { ttf_px = atoi(argv[++i]); px_cli = true; }
 		else if (!strcmp(argv[i], "-s") && i + 1 < argc) font_sym_path = argv[++i];
+		else if (!strcmp(argv[i], "-E") && i + 1 < argc) font_emoji_path = argv[++i];
 		else if (!strcmp(argv[i], "-r") && i + 1 < argc) { rotation = atoi(argv[++i]) % 360; rot_cli = true; }
 		else if (!strcmp(argv[i], "-P") && i + 1 < argc) settings_path = argv[++i];
+		else if (!strcmp(argv[i], "-X") && i + 1 < argc) plugins_dir = argv[++i];
 		else if (!strcmp(argv[i], "-T") && i + 1 < argc) btn_exit = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-D") && i + 1 < argc) btn_bottom = atoi(argv[++i]);
 		else break;
 	}
 	(void)opt;
 	if (settings_path) settings_load(px_cli, rot_cli);
+	plugins_load();
 	char *defcmd[] = {"/bin/sh", NULL};
 	char **cmd = i < argc ? &argv[i] : defcmd;
 
@@ -1298,6 +2114,9 @@ int main(int argc, char **argv) {
 		LOG("fb ptr=%p size=%zu stride=%d %dx%d bpp=%u shifts r%d g%d b%d a%d", fbmem, fbmem_size, fb_stride, scr_w, scr_h, vi.bits_per_pixel, sh_r, sh_g, sh_b, sh_a);
 		if (fbmem && vi.bits_per_pixel == 32 && ttf_init()) {
 			use_ttf = true;
+			scan_keyboards();
+			if (rot_auto) acc_enable(true);
+			osk_visible = osk_want();
 			cellpx_w = cell_w; cellpx_h = cell_h;
 			compute_geometry();
 		} else LOG("TTF renderer unavailable, using FBInk bitmap font");
@@ -1336,7 +2155,7 @@ int main(int argc, char **argv) {
 	fcntl(ptyfd, F_SETFL, O_NONBLOCK);
 	if (inject_path) { unlink(inject_path); if (mkfifo(inject_path, 0666) == 0) ifd = open(inject_path, O_RDWR | O_NONBLOCK); }
 
-	double lastscan = 0, last_activity = now(), last_full = 0, next_repeat = 0;
+	double lastscan = 0, last_activity = now(), last_full = 0, next_repeat = 0, osk_pend = 0;
 	int repeat_code = -1;
 	bool idle_pending = false, a2_pending = false, full_pending = false;
 	double last_a2 = 0;
@@ -1362,9 +2181,21 @@ int main(int argc, char **argv) {
 		int timeout = 250;
 		if (repeat_code >= 0) { int d = (int)((next_repeat - t) * 1000); timeout = d < 0 ? 0 : d; }
 		else if (idle_pending) timeout = 100;
-		if (a2_pending) { int d = (int)((last_a2 + 0.06 - t) * 1000) + 1; if (d < 0) d = 0; if (d < timeout) timeout = d; }
+		if (a2_pending) { int d = (int)((last_a2 + rf_batch_ms / 1000.0 - t) * 1000) + 1; if (d < 0) d = 0; if (d < timeout) timeout = d; }
+		if (osk_rep && timeout > 30) timeout = 30;
+		if (osk_lit && timeout > 20) timeout = 20;
+		if (ov_up && timeout > 100) timeout = 100;
+		if ((rot_pending >= 0 || (rot_auto && acc_dir[0])) && timeout > 100) timeout = 100;
 		poll(p, np, timeout);
 		t = now();
+
+		// On-screen keyboard: follow the setting (Auto = shown while no keyboard is connected; wait 3 s before flipping so
+		// a keyboard that is reconnecting does not make the terminal jump about).
+		if (use_ttf && !locked && !menu_open) {
+			if (osk_want() == osk_visible) osk_pend = 0;
+			else if (osk_pend == 0) osk_pend = t;
+			else if (t - osk_pend >= 3.0) { osk_pend = 0; osk_sync(false); }
+		}
 
 		bool output = false;
 		if (bfd >= 0 && (p[bidx].revents & (POLLIN | POLLERR | POLLHUP))) {
@@ -1373,6 +2204,14 @@ int main(int argc, char **argv) {
 			if (n < 0 && errno != EAGAIN) { close(bfd); bfd = -1; }
 			for (int k = 0; k < n / (int)sizeof *ev; k++)
 				if (ev[k].type == EV_KEY && handle_button(ev[k].code, ev[k].value, t)) output = true;
+		}
+		acc_poll(t);
+		if (rot_pending >= 0 && !locked && t - rot_pend_t >= 0.7) {
+			rotation = rot_auto_last = rot_pending;
+			rot_pending = -1;
+			settings_save();
+			menu_open = false;
+			apply_geometry();
 		}
 		if (pfd >= 0 && (p[pidx].revents & (POLLIN | POLLERR | POLLHUP))) {
 			struct input_event ev[16];
@@ -1420,12 +2259,7 @@ int main(int argc, char **argv) {
 				if (v == 0) { if (code == repeat_code) repeat_code = -1; continue; }
 				if (locked) continue;
 				if (menu_open) {
-					LOG("menu key %d (page %d, item %d/%d)", code, menu_page, menu_sel, mcount);
-					if (code == KEY_UP || code == KEY_K || (code == KEY_TAB && mod_shift)) menu_prev();
-					else if (code == KEY_DOWN || code == KEY_J || code == KEY_TAB) menu_next();
-					else if (code == KEY_ENTER || code == KEY_KPENTER || code == KEY_RIGHT || code == KEY_SPACE) menu_activate();
-					else if (code == KEY_ESC || code == KEY_Q || code == KEY_LEFT || code == KEY_BACKSPACE) menu_back();
-					else if (code >= KEY_1 && code <= KEY_9 && code - KEY_1 < mcount) { menu_sel = code - KEY_1; menu_activate(); }
+					menu_key(code, mod_shift);
 					continue;
 				}
 				// Local controls: Ctrl+Alt+Backspace quits; Shift+PgUp/PgDn scroll history.
@@ -1451,6 +2285,13 @@ int main(int argc, char **argv) {
 				}
 			}
 		}
+		if (osk_rep && osk_down_key == osk_rep && t >= osk_next_rep && !menu_open && !locked) {
+			osk_send(osk_rep);
+			osk_next_rep = t + 0.09;
+		}
+		if (osk_lit && t >= osk_lit_until) osk_unlight();
+		if (ov_up && !t_edge && t >= ov_until) { ov_up = false; redraw_all(false); }
+		if (osk_new) { osk_new = false; idle_pending = true; last_activity = now(); }
 		if (repeat_code >= 0 && t >= next_repeat && !menu_open) {
 			char out[32];
 			int len = encode_key(repeat_code, out);
@@ -1461,17 +2302,18 @@ int main(int argc, char **argv) {
 			int n = draw(false);
 			if (n) { a2_pending = true; idle_pending = true; last_activity = now(); rows_since_flash += n; }
 		}
-		if (a2_pending && now() - last_a2 >= 0.06) {
-			refresh_dirty(WFM_DU, false);
+		if (a2_pending && now() - last_a2 >= rf_batch_ms / 1000.0) {
+			refresh_dirty(typing_wfm(), false);
 			last_a2 = now(); a2_pending = false;
 		}
-		if (idle_pending && !a2_pending && !menu_open && !locked && now() - last_activity > 0.6) {
-			quality_pass();
+		if (idle_pending && !a2_pending && !menu_open && !locked && now() - last_activity > (rf_quality_ms ? rf_quality_ms : 600) / 1000.0) {
+			if (rf_quality_ms) quality_pass();
+			osk_quality();
 			idle_pending = false; full_pending = true;
 		}
 		if (full_pending && !idle_pending && !menu_open && !locked && now() - last_activity > 4.0) {
 			// Long idle after plenty of changes: one flashing whole-screen GC16 to clear accumulated ghosting.
-			if (rows_since_flash >= FLASH_AFTER_ROWS) {
+			if (rf_flash_rows && rows_since_flash >= rf_flash_rows) {
 				refresh_flash = true;
 				refresh_dirty(WFM_GC16, true);
 				refresh_flash = false;
@@ -1500,6 +2342,7 @@ int main(int argc, char **argv) {
 	if (bfd >= 0) { ioctl(bfd, EVIOCGRAB, 0); close(bfd); }
 	if (tfd >= 0) { ioctl(tfd, EVIOCGRAB, 0); close(tfd); }
 	if (pfd >= 0) { ioctl(pfd, EVIOCGRAB, 0); close(pfd); }
+	if (rot_auto) acc_enable(false);
 	{
 		FBInkConfig c = cfg;
 		c.is_cleared = true; c.is_flashing = true; c.wfm_mode = WFM_GC16;

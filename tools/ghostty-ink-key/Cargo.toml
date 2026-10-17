@@ -1,5 +1,5 @@
 [package]
-name = "kgkey"
+name = "ghostty-ink-key"
 version = "0.1.0"
 edition = "2021"
 description = "Passphrase-protect an SSH private key at rest (age format) and decrypt it to stdout for one connection"
