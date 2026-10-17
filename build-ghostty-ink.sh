@@ -17,7 +17,7 @@ case "${1:-kobo}" in
     *) echo "usage: $0 [kobo|kindlepw2]"; exit 1 ;;
 esac
 mkdir -p "$OUT"
-"$CC" -O2 -Wall -Wno-unused-result -std=gnu11 $DEF -I"$V/include" -I"$FB" -I"$R/third_party/stb" \
+"$CC" -O2 -ffile-prefix-map="$R"=. -Wall -Wno-unused-result -std=gnu11 $DEF -I"$V/include" -I"$FB" -I"$R/third_party/stb" \
     "$R/src/ghostty-ink.c" -o "$OUT/ghostty-ink" \
     "$V/lib/libghostty-vt-fixed.a" "$FB/Release/static/libfbink.a" $EXTRA -lm -lrt -lpthread
 ls -l "$OUT/ghostty-ink"
