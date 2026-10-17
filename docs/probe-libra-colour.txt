@@ -456,7 +456,7 @@ PID   USER     TIME  COMMAND
 21101 root      0:00 [rx_thread]
 21122 root      0:00 wpa_supplicant -D nl80211 -s -i wlan0 -c /etc/wpa_supplicant/wpa_supplicant.conf -C /var/run/wpa_supplicant -B
 21125 root      0:00 [kworker/u5:1]
-21149 root      0:00 /bin/sh /mnt/onboard/.adds/kobo-ghostty/probe.sh
+21149 root      0:00 /bin/sh /mnt/onboard/.adds/ghostty-ink/probe.sh
 21195 root      0:00 ps
 23877 root      0:01 /usr/bin/wmt_launcher -p /lib/firmware
 23878 root      0:00 [mtk_stp_psm]

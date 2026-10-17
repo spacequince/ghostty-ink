@@ -1,6 +1,6 @@
-# kobo-ghostty
+# Ghostty Ink
 
-A terminal for the **Kobo Libra Colour**, started from NickelMenu (no KOReader). It is built for one job: SSH into
+A terminal for e-ink readers: the **Kobo Libra Colour** (started from NickelMenu, no KOReader) and, experimental and **not yet tested on a Kindle**, the **Kindle Paperwhite 3** (started from KUAL, see [docs/kindle.md](docs/kindle.md)). It is built for one job: SSH into
 another machine, attach tmux, and type on a Bluetooth keyboard.
 
 ```
@@ -10,7 +10,7 @@ BT keyboard -> evdev -> keymap -> libghostty-vt (terminal state) -> cell grid ->
 ```
 
 The terminal core is [libghostty-vt](https://github.com/ghostty-org/ghostty) (Ghostty's VT parser, screen and scrollback
-state, as a C library). Everything else is ours: `src/kgterm.c`.
+state, as a C library). Everything else is ours: `src/ghostty-ink.c`.
 
 ## Features
 
@@ -19,9 +19,19 @@ state, as a C library). Everything else is ours: `src/kgterm.c`.
   you changed once you stop; a flashing clean-up after large changes. Coloured backgrounds use a grayscale waveform.
 - Bluetooth keyboard (grabbed via evdev, own key repeat), touch (taps/long-press become mouse clicks when the program asks
   for the mouse, drags scroll), page-turn buttons (top: menu, bottom: refresh), power button locks the screen.
+- On-screen keyboard: Esc, Tab, `~`, `-`, `/`, `|`, arrows, Home/End/PgUp/PgDn and sticky Ctrl/Alt on top, then a full US
+  layout (number row that turns into F1-F12 with Fn, Del/Ins/Enter/Bksp, Shift). It appears by itself while no Bluetooth
+  keyboard is connected; the terminal is resized to the space above it. Two-finger swipe up shows it, two-finger swipe
+  down hides it (Menu > Touch lets you change what each swipe does); Menu > On-screen keyboard: auto / always / never.
+- Refresh settings (Menu > Screen refresh): typing waveform (DU / A2 / GL16), how long changes are batched, when the
+  anti-aliased clean-up runs, how often a flashing clean-up happens. The defaults are the original behaviour.
+- Plugins: drop a `NAME.plugin` folder into `plugins/` to add shell commands, menu entries or keyboard keys; switch each
+  one on or off in Menu > Plugins (all are off until you switch them on; the choice is remembered; see [docs/plugins.md](docs/plugins.md)).
 - Menu (top button): orientation (4 rotations), text size, light/dark theme, colour treatment (as sent / readable /
   grayscale / black & white), frontlight brightness and warmth, touch options, lock, clear ghosting, reboot, power off.
-  Settings persist in `settings.conf`.
+  The menu also works with the on-screen keyboard (arrows, Tab, Enter, Esc, digits). Slide one finger up or down along the
+  left screen edge to change the frontlight, along the right edge to change warmth (where the device has it); a short
+  overlay shows the value. Settings persist in `settings.conf` (written atomically).
 - Starts in a local shell with persistent history (Up arrow, Ctrl+R) and an `ssh` helper; when a session ends the screen
   stays with the exit status and Enter reconnects.
 
@@ -32,14 +42,16 @@ and Dropbear sources, and `stb_truetype.h` in `third_party/`.
 
 ```
 ./build-vt.sh && ./fix-vt.sh     # libghostty-vt for armv7, then localise Zig's weak libc symbols (see script)
-./build-kgterm.sh                # -> dist/device/kgterm
+./build-ghostty-ink.sh          # -> dist/device/ghostty-ink
+./build-key.sh                   # -> dist/device/ghostty-ink-key (passphrase protection for SSH keys)
 ```
 
 ## Install on the device
 
-Copy to `/mnt/onboard/.adds/kobo-ghostty/`: `bin/kgterm`, `bin/kgkey`, `bin/dbclient`, `bin/dropbearkey`, `ghostty.sh`, `shrc`,
-`kg-keys.sh`, `nickel-stop.sh`, `nickel-start.sh` (from `device/`), and fonts in `fonts/` (`regular.ttf`, `bold.ttf`, `symbols.ttf`;
-e.g. Adwaita Mono and Symbols Nerd Font Mono). Add `nickelmenu/ghostty` to `/mnt/onboard/.adds/nm/`.
+Copy to `/mnt/onboard/.adds/ghostty-ink/`: `bin/ghostty-ink`, `bin/ghostty-ink-key`, optionally `bin/bash` (`build-bash.sh`; readline with Ctrl-K/Ctrl-Y), `bin/dbclient`, `bin/dropbearkey`,
+`ghostty.sh`, `shrc`, `ssh-keygen.sh`, `ssh-copy-id.sh`, `plugins.sh`, `nickel-stop.sh`, `nickel-start.sh` (from `device/`), fonts in
+`fonts/` (`regular.ttf`, `bold.ttf`, `symbols.ttf`, `emoji.ttf`; e.g. Adwaita Mono, Symbols Nerd Font Mono and Noto Emoji, the monochrome one: colour emoji fonts do not work. Emoji are drawn two cells wide in the text colour) and, if you want them,
+plugins in `plugins/` (examples in this repo's `plugins/`). Add `nickelmenu/ghostty` to `/mnt/onboard/.adds/nm/`.
 Copy `device/ghostty.conf.example` to `ghostty.conf` and adjust it.
 
 Notes learnt the hard way:
@@ -52,40 +64,63 @@ Notes learnt the hard way:
 
 `ssh` in the Kobo shell is dropbear's `dbclient` with a keepalive and strict host-key checking (no auto-accept; the first
 time you connect to a host it asks you to confirm the fingerprint). Dropbear cannot read passphrase-protected keys, so
-`kgkey` (`tools/kgkey`, built with `./build-kgkey.sh`) keeps the key **encrypted at rest** in the [age](https://age-encryption.org)
-format (scrypt + ChaCha20-Poly1305, no home-made crypto) and the `ssh` helper decrypts it into RAM (`/tmp`) for the length of one
-connection only. The key lives on the Kobo's root filesystem (`/etc/kobo-ghostty/`), **not** on the USB-visible FAT partition.
+`ghostty-ink-key` (`tools/ghostty-ink-key`, built with `./build-key.sh`) keeps the key **encrypted at rest** in the
+[age](https://age-encryption.org) format (scrypt + ChaCha20-Poly1305, no home-made crypto) and the `ssh` helper decrypts it
+into RAM (`/tmp`) for the length of one connection only. The key lives on the Kobo's root filesystem (`/etc/ghostty-ink/`),
+**not** on the USB-visible FAT partition.
 
-Set up a key (run these in the Kobo's own shell, the one you get when you start Ghostty terminal):
-
-```
-kg-newkey            # generates a key pair, asks for a passphrase (twice), prints the PUBLIC key
-```
-
-Then authorize the printed public key on the server, as one line in `~/.ssh/authorized_keys`, ideally with restrictions:
+The shell has two commands with the names you know. They are **Ghostty Ink's light versions**, small re-implementations
+for this Dropbear setup (each says so when it runs), not OpenSSH's programs:
 
 ```
-restrict,pty,from="<your LAN>/24" ssh-ed25519 <the printed key> kobo-ghostty
+ssh-keygen                  # new ed25519 key, asks for a passphrase twice, prints the public key
+ssh-copy-id user@host       # logs in once with the account's password and appends the key to ~/.ssh/authorized_keys
+ssh user@host               # asks for the key's passphrase, then connects; Up arrow / Ctrl+R recall earlier commands
 ```
 
-(add `,command="tmux -u new -A -s kobo"` after `pty` to force a tmux session.) From now on:
+`ssh-copy-id` skips a key that is already there; `-r` writes it as `restrict,pty <key>` (no forwarding), `-p PORT` picks the
+port. (To add more restrictions such as `from="<your LAN>/24"` or `command="tmux -u new -A -s kobo"`, edit the line on the
+server afterwards.) Or do it by hand: the public key is one line to append to `~/.ssh/authorized_keys`.
+
+More than one key (e.g. one per computer): give the key a name. The default key is untouched.
 
 ```
-ssh user@host        # asks for the passphrase, then connects; Up arrow / Ctrl+R recall earlier commands
+ssh-keygen -f work          # new passphrase-protected key /etc/ghostty-ink/id_work.enc
+ssh-copy-id -i work user@host
+ssh -k work user@host       # use it;  plain `ssh user@host` still uses the default key
+ssh-keygen -l               # list keys;  -y [-f NAME] prints a public key, -p [-f NAME] locks an old plain key
 ```
 
-Other helpers: `kg-pubkey` prints the public key again; `kg-lockkey` puts a passphrase on a key that already exists in plain
-form (but a key that was ever stored unencrypted may linger in flash, so prefer `kg-newkey` plus replacing the old key on the server).
-Choose a passphrase you can type on the Bluetooth keyboard; there is no recovery if you forget it, just make a new key.
-Disable password logins on the server, and use `tmux -u` there (dbclient forwards no locale, so tmux otherwise turns every
-non-ASCII glyph into `_`).
+Choose a passphrase you can type on the Bluetooth keyboard or the on-screen one; there is no recovery if you forget it, just
+make a new key. A key that was ever stored unencrypted may linger in flash, so prefer a new key to `ssh-keygen -p`. Disable
+password logins on the server, and use `tmux -u` there (dbclient forwards no locale, so tmux otherwise turns every non-ASCII
+glyph into `_`).
+
+Is the SSH side up to date with OpenSSH's post-quantum key exchange? Yes, the bundled Dropbear already negotiates
+`sntrup761x25519` / `mlkem768x25519`. See [docs/security.md](docs/security.md) for that, the review and the OpenSSH option.
 
 ## Layout
 
-- `src/kgterm.c` — the terminal; `tools/kgkey` — passphrase protection for the SSH key; `build-*.sh`, `fix-vt.sh` — build scripts
-- `device/` — launcher (`ghostty.sh`), shell setup (`shrc`), key helpers (`kg-keys.sh`), Nickel stop/start, example config
+- `src/ghostty-ink.c` — the terminal; `tools/ghostty-ink-key` — passphrase protection for the SSH key; `build-*.sh`, `fix-vt.sh` — build scripts
+  (`build-openssh.sh` is an experiment, see the security doc)
+- `device/` — launcher (`ghostty.sh`), shell setup (`shrc`), `ssh-keygen.sh`, `ssh-copy-id.sh`, `plugins.sh`, Nickel stop/start, example config
+- `plugins/` — example plugins (`tmux.plugin`, `hello.plugin`); how they work: `docs/plugins.md`
 - `nickelmenu/ghostty` — the NickelMenu entry
-- `docs/` — device findings (`docs/raw/` holds scrubbed probe output)
+- `docs/` — device findings `plugins.md`, `security.md`
 - `.githooks/pre-commit` — refuses commits containing keys, LAN IPs or MAC addresses (`git config core.hooksPath .githooks`)
 
-Third-party: libghostty-vt (MIT), FBInk (GPL-3.0), Dropbear (MIT), stb_truetype (public domain), age (MIT/Apache-2.0); fonts keep their own licences.
+## Known limitations
+
+- **Dropped connections.** The SSH client sends keepalives but does not reconnect by itself, and the terminal does not survive
+  a network drop gracefully: when the session ends the screen stays and Enter reconnects. Run `tmux` on the server so your work
+  survives (the `tmux` plugin helps). Better resilience (automatic reconnect, mosh-style roaming) is planned.
+- **Kindle Paperwhite 3 is untested** on hardware (see [docs/kindle.md](docs/kindle.md)). Only the Kobo Libra Colour (kernel 4.9.77) has been tested.
+- Emoji are monochrome and drawn two cells wide; colour emoji fonts do not work.
+- Exiting the terminal on the Kobo reboots it.
+
+## License
+
+Ghostty Ink is licensed under the GNU General Public License v3.0 (see [LICENSE](LICENSE)). It links FBInk (GPL-3.0). Components
+and their licences are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+Third-party: libghostty-vt (MIT), FBInk (GPL-3.0), Dropbear (MIT), stb_truetype (public domain), age (MIT/Apache-2.0), OpenSSH (BSD, experiment only); fonts keep their own licences.
