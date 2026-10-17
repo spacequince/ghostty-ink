@@ -1,0 +1,11 @@
+{
+	"items": [
+		{
+			"name": "Ghostty Ink terminal",
+			"priority": 0,
+			"action": "/mnt/us/extensions/ghostty-ink/ghostty-kindle.sh",
+			"exitmenu": true,
+			"refresh": false
+		}
+	]
+}
